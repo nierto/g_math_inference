@@ -86,6 +86,11 @@ assert_eq!(planar.matvec(&acts), dense);
 - `PlanarTQ19` / `HybridTQ19` are lossless: their matvec equals dense matvec
   bit-for-bit; they change only the weight byte layout.
 
+## Versions
+
+Each release names the g_math version it was verified against (see
+CHANGELOG.md). 0.1.0 depends on `g_math = "0.7"`.
+
 ## Tests
 
 `cargo test --release` (unit, integration, doc); the differential gate
