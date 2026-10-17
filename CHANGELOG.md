@@ -3,6 +3,17 @@
 All notable changes to g_math_inference are documented in this file. Each
 release names the g_math version it was verified against.
 
+## [0.1.1] - 2026-10-17
+
+Licence only; the code is identical to 0.1.0. Verified against g_math 0.7.0.
+
+### Licence
+
+- `LICENSE` grants a free 30-day evaluation for non-production use (0.1.0
+  granted no use without a licence agreement). Production use and
+  redistribution still require a licence agreement; enquiries to
+  niels@nierto.com.
+
 ## [0.1.0] - 2026-10-17
 
 Verified against g_math 0.7.0.
