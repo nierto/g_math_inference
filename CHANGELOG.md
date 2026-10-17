@@ -3,6 +3,24 @@
 All notable changes to g_math_inference are documented in this file. Each
 release names the g_math version it was verified against.
 
+## [0.1.2] - 2026-10-17
+
+Licence only; the code is identical to 0.1.0 and 0.1.1. Verified against
+g_math 0.7.0.
+
+### Licence
+
+- Source-available under PolyForm Noncommercial 1.0.0 (`LICENSE.md`);
+  `Cargo.toml` declares `PolyForm-Noncommercial-1.0.0`. This replaces the
+  proprietary `LICENSE` of 0.1.0 and 0.1.1.
+- `MANIFERENCE-GRANT.md`: everyone licensed for maniference (PolyForm
+  Noncommercial, PolyForm Small Business or a commercial licence) may use
+  g_math_inference as part of maniference on the same terms. Use apart from
+  maniference, or to build a competing inference engine, is not covered.
+- `COMMERCIAL.md`: component licences at one fifth of the maniference
+  price, a perpetual licence at 3x, a field-of-use limit, and a competitor
+  licence by agreement.
+
 ## [0.1.1] - 2026-10-17
 
 Licence only; the code is identical to 0.1.0. Verified against g_math 0.7.0.

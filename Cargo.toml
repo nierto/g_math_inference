@@ -1,10 +1,10 @@
 [package]
 name = "g_math_inference"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "TQ1.9 and five-trit ternary inference kernels over g_math fixed-point formats"
 authors = ["Niels Erik Toren"]
-license-file = "LICENSE"
+license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/nierto/g_math_inference"
 readme = "README.md"
 keywords = ["ternary", "quantization", "inference", "fixed-point", "no-float"]
