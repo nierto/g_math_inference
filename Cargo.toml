@@ -7,11 +7,11 @@ authors = ["Niels Erik Toren"]
 license-file = "LICENSE"
 repository = "https://github.com/nierto/g_math_inference"
 readme = "README.md"
-# no accidental publish before the owner releases it
-publish = false
+keywords = ["ternary", "quantization", "inference", "fixed-point", "no-float"]
+categories = ["mathematics", "science"]
+exclude = ["differential/", "scripts/"]
 
 [dependencies]
-# path during development; "0.7" at release
 g_math = "0.7"
 rayon = "1.10"
 
