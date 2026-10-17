@@ -31,5 +31,5 @@ Verified against g_math 0.7.0.
 
 ### Licence
 
-Proprietary (see `LICENSE`); licensing enquiries to niels@nierto.com. The versions of this code published inside
+Proprietary (see `LICENSE`), with a free 30-day evaluation for non-production use; licensing enquiries to niels@nierto.com. The versions of this code published inside
 g_math 0.4.x to 0.6.8 remain available under MIT or Apache-2.0.

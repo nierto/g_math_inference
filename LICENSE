@@ -10,6 +10,12 @@ by its download from any registry or repository, or by this notice.
 Use of this software requires a separate written licence agreement with the
 copyright holder. Licensing enquiries: niels@nierto.com
 
+Evaluation: as the only exception, you may download, build and run this
+software, without charge, for evaluation and other non-production purposes
+for 30 days from your first use of it. This permission does not cover
+production use, redistribution, or use beyond those 30 days; continued or
+production use requires a licence agreement as described above.
+
 Versions of this code that were published inside the crate g_math, releases
 0.4.x to 0.6.8 (the module `g_math::tq19`), remain available under the MIT
 or Apache-2.0 licences they were released with. This notice applies to
