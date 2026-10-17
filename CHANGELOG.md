@@ -3,7 +3,7 @@
 All notable changes to g_math_inference are documented in this file. Each
 release names the g_math version it was verified against.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-10-17
 
 Verified against g_math 0.7.0.
 

@@ -6,13 +6,13 @@ later): TQ1.9 (ten trits per weight in an i16), the five-trit row-scaled
 form, the bf16 / binary16 weight decoders and the quantisers, the
 compute-tier wide-output matvecs and the rayon row-parallel forms.
 
-Until g_math 0.6.7 this was the module `g_math::tq19` behind the
+Up to g_math 0.6.8 this was the module `g_math::tq19` behind the
 `inference` feature. The code moved here unchanged apart from its paths;
 its differential gate against g_math 0.6.7 shows no difference in value,
 error or panic on any of the module's kernels at six formats.
 
 Licence: proprietary, see `LICENSE`; licensing enquiries to niels@nierto.com. The versions published inside
-g_math 0.4.x to 0.6.7 remain available under MIT or Apache-2.0.
+g_math 0.4.x to 0.6.8 remain available under MIT or Apache-2.0.
 
 ## What it is
 
