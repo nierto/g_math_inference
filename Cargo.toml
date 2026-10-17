@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 # path during development; "0.7" at release
-g_math = { path = "../gMath-wt6" }
+g_math = { path = "../gMath" }
 rayon = "1.10"
 
 [profile.release]

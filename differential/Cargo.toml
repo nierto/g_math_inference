@@ -11,7 +11,7 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-g_math = { path = "../../gMath-wt6" }
+g_math = { path = "../../gMath" }
 g_math_inference = { path = ".." }
 g_math_065 = { package = "g_math", version = "=0.6.7", features = ["inference"] }
 
