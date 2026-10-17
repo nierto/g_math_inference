@@ -11,7 +11,7 @@ Until g_math 0.6.7 this was the module `g_math::tq19` behind the
 its differential gate against g_math 0.6.7 shows no difference in value,
 error or panic on any of the module's kernels at six formats.
 
-Licence: see `LICENSE` (proprietary). The versions published inside
+Licence: proprietary, see `LICENSE`; licensing enquiries to niels@nierto.com. The versions published inside
 g_math 0.4.x to 0.6.7 remain available under MIT or Apache-2.0.
 
 ## What it is
