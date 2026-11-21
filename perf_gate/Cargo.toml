@@ -1,0 +1,22 @@
+# Speed-only changes against the published 0.1.2: the same outputs (tests/)
+# and ns per call at an inference engine's shapes (src/main.rs). Not published.
+#   cd perf_gate && cargo test --release          # identical outputs
+#   cd perf_gate && cargo run --release -- [crossover]  # timings, old vs new
+[package]
+name = "g_math_inference_perf_gate"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+g_math = "0.7"
+new = { package = "g_math_inference", path = ".." }
+old = { package = "g_math_inference", version = "=0.1.2" }
+rayon = "1"
+
+[profile.release]
+debug = false
+codegen-units = 1
+opt-level = 3

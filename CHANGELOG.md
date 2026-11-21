@@ -3,6 +3,32 @@
 All notable changes to g_math_inference are documented in this file. Each
 release names the g_math version it was verified against.
 
+## [0.1.3] - 2026-11-22
+
+Speed only; every result is the same integer as in 0.1.2. Verified against
+g_math 0.7.2 and 0.7.3.
+
+### Changed
+
+- `RowScaledTQ5::matvec_batch_par` (and `_into`): a 3-row by 4-token register
+  tile replaces the 4 x 4 one, whose 16 accumulators, 4 widened weight
+  vectors and one activation (21) exceeded AVX2's 16 vector registers and
+  spilled on every step. The 1 to 3 tokens left over in a chunk run a
+  3 x 1..3 tile instead of one dot per row and token, which is what batches
+  of 2 and 3 take. Batch 64: 12 to 21 percent faster; batches of 2, 3 and 8:
+  10 to 22 percent (i7-7700, 8 threads).
+- `RowScaledTQ5::matvec_par` and `matvec_q2f_par`: below 256 KiB of weights
+  the calling thread does the work (a fork/join across the pool cost more
+  than the rows), and parallel tasks take at least 64 KiB of weights each.
+
+### Validation
+
+- `perf_gate/` (not packaged): every RowScaledTQ5 entry point against the
+  published 0.1.2 on shapes that reach every path (rows and columns on and
+  off the tile and SIMD widths, batches 1 to 9 and 64, activations with
+  sparse, dense and unsplittable high halves, scales that reach the overflow
+  panic), at Q22.10 and Q16.16: 6912 outcomes, panics included, all equal.
+
 ## [0.1.2] - 2026-10-17
 
 Licence only; the code is identical to 0.1.0 and 0.1.1. Verified against
