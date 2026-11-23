@@ -68,7 +68,7 @@ assert_eq!(planar.matvec(&acts), dense);
   five trits in an i8 per weight. `RowScaledTQ5` is half the bytes per weight;
   its kernels (scalar, AVX2 on 16-bit halves of the activations, a 3x4
   register tile for batches) all compute the same integer per row.
-- **`NvFp4Matrix`** and **`MxFp8Matrix`** (unreleased): block-scaled
+- **`NvFp4Matrix`** and **`MxFp8Matrix`** (0.1.4): block-scaled
   weights as stored in NVFP4 and MXFP8 checkpoints, computed on directly at
   their stored 4.5 and 8.25 bits per weight. Every weight is read as an
   integer times a power of two (and, for NVFP4, one exact `amax / den`

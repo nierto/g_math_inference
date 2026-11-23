@@ -3,10 +3,11 @@
 All notable changes to g_math_inference are documented in this file. Each
 release names the g_math version it was verified against.
 
-## [Unreleased]
+## [0.1.4] - 2026-11-23
 
 Block-scaled weights computed on directly, exactly, in integers. Nothing
 already shipped changes: every existing kernel returns the same integers.
+Verified against g_math 0.7.3 and 0.7.4.
 
 ### Added
 
