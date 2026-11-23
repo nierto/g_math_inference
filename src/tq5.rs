@@ -43,15 +43,15 @@ pub struct RowScaledTQ5 {
 /// elements carry one, a row's dot runs as one 16-bit multiply-add over `lo` plus a scalar
 /// correction over the listed high halves: `sum(c*x) = sum(c*lo) + (sum(c*hi) << 16)`, the
 /// same integer as the dense two-multiply form.
-struct SplitActivation {
-    lo: Vec<i16>,
-    hi: Vec<i16>,
+pub(crate) struct SplitActivation {
+    pub(crate) lo: Vec<i16>,
+    pub(crate) hi: Vec<i16>,
     /// `(index, hi)` for every element whose high half is not zero.
-    hi_nz: Vec<(u32, i16)>,
+    pub(crate) hi_nz: Vec<(u32, i16)>,
 }
 
 impl SplitActivation {
-    fn new(x: &[i32]) -> Option<Self> {
+    pub(crate) fn new(x: &[i32]) -> Option<Self> {
         // unsigned_abs: |i32::MIN| is 2^31, which `abs` cannot represent
         if x.iter().any(|&v| v.unsigned_abs() >= 1 << 30) {
             return None;
@@ -74,7 +74,7 @@ impl SplitActivation {
     /// At most one element in eight carries a high half: the low-half multiply plus the
     /// scalar correction is then cheaper than two dense multiplies.
     #[inline]
-    fn sparse(&self) -> bool {
+    pub(crate) fn sparse(&self) -> bool {
         self.hi_nz.len() * 8 <= self.lo.len()
     }
 
@@ -90,7 +90,7 @@ impl SplitActivation {
 }
 
 /// Whether the AVX2 kernel is usable on this machine (checked once).
-fn avx2_available() -> bool {
+pub(crate) fn avx2_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -223,9 +223,9 @@ unsafe fn tile_lo<const R: usize, const T: usize>(rows: [&[i8]; R], los: [&[i16]
 }
 
 /// Weight bytes below which `matvec_par` runs on the calling thread.
-const SERIAL_BELOW_BYTES: usize = 256 * 1024;
+pub(crate) const SERIAL_BELOW_BYTES: usize = 256 * 1024;
 /// Weight bytes per parallel task at least (fewer, larger tasks per fork/join).
-const MIN_TASK_BYTES: usize = 64 * 1024;
+pub(crate) const MIN_TASK_BYTES: usize = 64 * 1024;
 
 /// Rows per register tile and tokens per full tile of the batched matvec.
 const TILE_R: usize = 3;

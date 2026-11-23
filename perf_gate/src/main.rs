@@ -57,6 +57,7 @@ fn time2(reps: usize, mut f: impl FnMut(), mut g: impl FnMut()) -> (f64, f64) {
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("crossover") { crossover(); return; }
+    if std::env::args().nth(1).as_deref() == Some("blockscaled") { blockscaled(); return; }
     let mut rng = Rng(0x5EED_0001);
     println!("threads: {}", rayon::current_num_threads());
     println!("{:<34} {:>14} {:>14} {:>8}", "RowScaledTQ5", "0.1.2 ns", "now ns", "ratio");
@@ -94,5 +95,54 @@ fn crossover() {
         let x = activation(&mut rng, cols);
         let (s, p) = time2(600, || { black_box(m.matvec(black_box(&x))); }, || { black_box(m.matvec_par(black_box(&x))); });
         println!("{:<20} {:>10} {:>12.0} {:>12.0}", format!("{rows}x{cols}"), rows * cols / 1024, s, p);
+    }
+}
+
+/// NVFP4 and MXFP8 beside RowScaledTQ5 at an expert's shapes. Each format
+/// cycles through 16 distinct matrices so decode streams from DRAM as a
+/// model's experts do (one matrix would sit in L3); the three formats are
+/// interleaved call by call. Scales as in shipped checkpoints.
+fn blockscaled() {
+    let mut rng = Rng(0x5EED_0B5C);
+    const K: usize = 16;
+    println!("threads: {}", rayon::current_num_threads());
+    println!("{:<40} {:>12} {:>12} {:>12} {:>7} {:>7}", "us per call (median)", "TQ5", "NVFP4", "MXFP8", "NV/TQ5", "MX/TQ5");
+    for &(rows, cols) in &[(2304usize, 2304usize), (2304, 1152)] {
+        let tq: Vec<new::RowScaledTQ5> = (0..K).map(|_| { let (d, s) = parts(&mut rng, rows, cols); new::RowScaledTQ5::from_parts(rows, cols, d, s) }).collect();
+        let nv: Vec<new::NvFp4Matrix> = (0..K).map(|_| {
+            let codes = (0..rows * cols / 2).map(|_| rng.next() as u8).collect();
+            let scales = (0..rows * cols / 16).map(|_| loop { let b = (((rng.next() % 5) + 11) << 3 | (rng.next() % 8)) as u8; if b & 0x7F != 0x7F { break b; } }).collect();
+            new::NvFp4Matrix::from_parts(rows, cols, codes, scales, 0x3EA0_0000 | (rng.next() as u32 & 0x7_FFFF), 0x4528_0000).unwrap()
+        }).collect();
+        let mx: Vec<new::MxFp8Matrix> = (0..K).map(|_| {
+            let elems = (0..rows * cols).map(|_| loop { let b = rng.next() as u8; if b & 0x7F != 0x7F { break b; } }).collect();
+            let scales = (0..rows * cols / 32).map(|_| (113 + rng.next() % 5) as u8).collect();
+            new::MxFp8Matrix::from_parts(rows, cols, elems, scales).unwrap()
+        }).collect();
+        assert!(nv.iter().all(|m| m.simd_eligible()) && mx.iter().all(|m| m.simd_eligible()));
+        let bpw = |bytes: usize| bytes as f64 * 8.0 / (rows * cols) as f64;
+        println!("{rows}x{cols}: bits per weight TQ5 {:.2}  NVFP4 {:.2}  MXFP8 {:.2}", bpw(tq[0].size_bytes()), bpw(nv[0].size_bytes()), bpw(mx[0].size_bytes()));
+        let x = activation(&mut rng, cols);
+        let xs: Vec<Vec<Fx>> = (0..64).map(|_| activation(&mut rng, cols)).collect();
+        let refs: Vec<&[Fx]> = xs.iter().map(|v| &v[..]).collect();
+        let modes: [(&str, usize); 3] = [("matvec (1 thread)", 40), ("matvec_par", 200), ("matvec_batch_par b64", 12)];
+        for (mode, reps) in modes {
+            let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..reps + 3 {
+                let k = i % K;
+                let t = Instant::now();
+                match mode { "matvec (1 thread)" => { black_box(tq[k].matvec(black_box(&x))); } "matvec_par" => { black_box(tq[k].matvec_par(black_box(&x))); } _ => { black_box(tq[k].matvec_batch_par(black_box(&refs))); } }
+                let ta = t.elapsed().as_nanos() as f64;
+                let t = Instant::now();
+                match mode { "matvec (1 thread)" => { black_box(nv[k].matvec(black_box(&x))); } "matvec_par" => { black_box(nv[k].matvec_par(black_box(&x))); } _ => { black_box(nv[k].matvec_batch_par(black_box(&refs))); } }
+                let tb = t.elapsed().as_nanos() as f64;
+                let t = Instant::now();
+                match mode { "matvec (1 thread)" => { black_box(mx[k].matvec(black_box(&x))); } "matvec_par" => { black_box(mx[k].matvec_par(black_box(&x))); } _ => { black_box(mx[k].matvec_batch_par(black_box(&refs))); } }
+                let tc = t.elapsed().as_nanos() as f64;
+                if i >= 3 { a.push(ta); b.push(tb); c.push(tc); }
+            }
+            let (a, b, c) = (median(a) / 1e3, median(b) / 1e3, median(c) / 1e3);
+            println!("  {:<38} {:>12.1} {:>12.1} {:>12.1} {:>7.2} {:>7.2}", mode, a, b, c, b / a, c / a);
+        }
     }
 }

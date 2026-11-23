@@ -3,6 +3,66 @@
 All notable changes to g_math_inference are documented in this file. Each
 release names the g_math version it was verified against.
 
+## [Unreleased]
+
+Block-scaled weights computed on directly, exactly, in integers. Nothing
+already shipped changes: every existing kernel returns the same integers.
+
+### Added
+
+- `NvFp4Matrix`: four-bit E2M1 codes, an E4M3 scale per 16 columns and one
+  `amax / den` factor per matrix, at the stored 4.5 bits per weight.
+  `value = E2M1(code) * E4M3(scale) * amax / den`; the factor is held as an
+  exact fraction (`den` is not a power of two in shipped checkpoints), so a
+  row costs one exact floor division at the end, by a precomputed
+  reciprocal. Codes are regrouped once at construction (same bytes) so one
+  load gives sixteen codes in column order; `to_codes` returns the stored
+  layout.
+- `MxFp8Matrix`: E4M3 elements and a UE8M0 scale per 32 columns (8.25 bits
+  per weight). Single rows run in 16-bit exponent classes with the block
+  shift folded into a table; batches decode each row once into two 16-bit
+  limbs per weight.
+- Both: `matvec`, `matvec_par`, `matvec_batch_par(_into)`, `matvec_q2f(_par)`
+  with the signatures and output rounding of `RowScaledTQ5`
+  (`floor(sum value * x)`, panic past the word), `dequant_row_exact`,
+  `simd_eligible`. Any matrix outside the AVX2 bounds (block scales far
+  apart) takes the exact scalar path (i128, or I512 for MXFP8 scale spreads
+  beyond 52).
+- `bits`: `E2M1_X2` / `e2m1_x2`, `decompose_e4m3`, `ue8m0_exponent`,
+  `decompose_f32`, as integers and powers of two (no float type).
+
+### Validation
+
+- `tests/blockscaled_validation.rs`: the decoders against Fraction values
+  from the format definitions for every pattern; 229 reference rows
+  (scripts/generate_blockscaled_refs.py, Fraction arithmetic, no floats) at
+  subnormal, zero, negative and largest scales, UE8M0 0 and 254, amax/den of
+  every kind and |x| up to 2^31, every form and each row alone (value or
+  panic); a random differential at 2304 x 2304 and 2304 x 1152 with batches
+  1 to 9 and 64 at 1, 2, 3 and 8 threads, every SIMD class count and the
+  scalar paths: 3.3 million row outputs, all exact. With `GMI_REAL_SLICES`,
+  real checkpoint slices against exact outputs
+  (scripts/generate_blockscaled_real_refs.py). Mutations of the kernels
+  (nibble order, class tables, limb shift and order, floor division) each
+  fail the gate.
+
+### Speed
+
+i7-7700, 4 cores / 8 threads, one of 16 matrices per call (DRAM, as a
+model's experts), us per call, against `RowScaledTQ5` at the same shape:
+
+| 2304 x 2304 | TQ5 | NVFP4 | MXFP8 |
+|---|---|---|---|
+| bits per weight | 8.03 | 4.50 | 8.25 |
+| matvec, 1 thread | 496 | 518 | 2180 |
+| matvec_par | 210 | 149 | 529 |
+| matvec_batch_par, 64 | 4673 | 5403 | 10050 |
+
+On these 4 cores NVFP4 decode is compute-bound (the shuffle port decodes
+two codes per byte); with more cores it reaches the bandwidth bound at
+about 0.56 of TQ5's bytes. MXFP8's 18-bit elements need several 16-bit
+multiply-adds each.
+
 ## [0.1.3] - 2026-11-22
 
 Speed only; every result is the same integer as in 0.1.2. Verified against

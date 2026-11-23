@@ -13,6 +13,11 @@
 //! - [`WeightBits`]: a row-major matrix of patterns as read from a file, the
 //!   input of the quantisers in [`super::quantize`].
 //!
+//! - [`E2M1_X2`] / [`e2m1_x2`], [`decompose_e4m3`], [`ue8m0_exponent`],
+//!   [`decompose_f32`]: the element and scale formats of block-scaled
+//!   checkpoints (NVFP4, MXFP8) and their 32-bit factors, as integers; the
+//!   kernels over them are in [`super::blockscaled`].
+//!
 //! Infinities and NaNs are refused with `InvalidInput`; a value outside the
 //! target range is `TierOverflow`.
 
@@ -176,4 +181,56 @@ impl WeightBits {
     pub fn decompose(&self, i: usize) -> Result<(bool, u64, i32), OverflowDetected> {
         decompose(self.bits[i], self.kind)
     }
+}
+
+/// The four-bit E2M1 element (1 sign, 2 exponent, 1 mantissa bit) times two,
+/// indexed by its code: `{0, 0.5, 1, 1.5, 2, 3, 4, 6}` doubled, so every
+/// value is an integer in `[-12, 12]` (three balanced trits). Code 8 is a
+/// negative zero and decodes to 0.
+pub const E2M1_X2: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// Twice the value of the E2M1 code in the low four bits of `code`.
+#[inline]
+pub fn e2m1_x2(code: u8) -> i8 {
+    E2M1_X2[(code & 0x0F) as usize]
+}
+
+/// An E4M3 pattern (1 sign, 4 exponent bits with bias 7, 3 mantissa bits; no
+/// infinities, `0x7F` and `0xFF` are NaN) as `(negative, m, e)` with
+/// `|v| = m * 2^e`: `m = 8 + mantissa`, `e = exponent - 10` for a normal
+/// pattern, `m = mantissa`, `e = -9` for a subnormal one. `m <= 15`, so the
+/// largest value is `15 * 2^5 = 448`. `Err(InvalidInput)` for a NaN.
+#[inline]
+pub fn decompose_e4m3(bits: u8) -> Result<(bool, u64, i32), OverflowDetected> {
+    if bits & 0x7F == 0x7F {
+        return Err(OverflowDetected::InvalidInput);
+    }
+    let sign = bits & 0x80 != 0;
+    let exp = ((bits >> 3) & 0x0F) as i32;
+    let mant = (bits & 0x07) as u64;
+    Ok(if exp == 0 { (sign, mant, -9) } else { (sign, mant | 0x08, exp - 10) })
+}
+
+/// A UE8M0 scale (an unsigned 8-bit exponent, the value `2^(bits - 127)`) as
+/// its exponent. `Err(InvalidInput)` for `0xFF` (NaN).
+#[inline]
+pub fn ue8m0_exponent(bits: u8) -> Result<i32, OverflowDetected> {
+    if bits == 0xFF {
+        return Err(OverflowDetected::InvalidInput);
+    }
+    Ok(bits as i32 - 127)
+}
+
+/// An IEEE binary32 pattern as `(negative, m, e)` with `|v| = m * 2^e` (`m`
+/// below `2^24`, the implicit bit included for a normal pattern). Zero gives
+/// `m = 0`. `Err(InvalidInput)` for an infinity or a NaN.
+#[inline]
+pub fn decompose_f32(bits: u32) -> Result<(bool, u64, i32), OverflowDetected> {
+    let sign = bits & 0x8000_0000 != 0;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = (bits & 0x007F_FFFF) as u64;
+    if exp == 0xFF {
+        return Err(OverflowDetected::InvalidInput);
+    }
+    Ok(if exp == 0 { (sign, mant, -149) } else { (sign, mant | 0x0080_0000, exp - 150) })
 }

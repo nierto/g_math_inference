@@ -72,6 +72,7 @@ macro_rules! on_words {
 }
 
 pub mod bits;
+pub mod blockscaled;
 mod hybrid;
 mod ops;
 mod planar;
@@ -87,6 +88,7 @@ pub use planar::{PlanarTQ19, PlaneData, NUM_PLANES, POW3, SPARSE_DENSITY_PERCENT
 pub use ops::{TqWord, WideOutput};
 pub use rowscaled::RowScaledTQ19;
 pub use tq5::{RowScaledTQ5, TQ5_MAX};
+pub use blockscaled::{MxFp8Matrix, NvFp4Matrix};
 
 use g_math::fixed_point::{Compute, Fixed, FixedNum};
 

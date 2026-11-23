@@ -66,10 +66,18 @@ assert_eq!(planar.matvec(&acts), dense);
 - **`RowScaledTQ19`** (realtime and compact) and **`RowScaledTQ5`** (realtime,
   0.6.5): one scale per row in unsigned Q32.32, with ten trits in an i16 or
   five trits in an i8 per weight. `RowScaledTQ5` is half the bytes per weight;
-  its kernels (scalar, AVX2 on 16-bit halves of the activations, a 4x4
+  its kernels (scalar, AVX2 on 16-bit halves of the activations, a 3x4
   register tile for batches) all compute the same integer per row.
+- **`NvFp4Matrix`** and **`MxFp8Matrix`** (unreleased): block-scaled
+  weights as stored in NVFP4 and MXFP8 checkpoints, computed on directly at
+  their stored 4.5 and 8.25 bits per weight. Every weight is read as an
+  integer times a power of two (and, for NVFP4, one exact `amax / den`
+  fraction per matrix); row sums are exact and each output is rounded once,
+  `floor`, as `RowScaledTQ5` rounds. The same forms as `RowScaledTQ5`
+  (`matvec`, `_par`, `_batch_par(_into)`, `matvec_q2f(_par)`).
 - **`bits`** and **`quantize`** (0.6.5): binary16 / bfloat16 bit
-  patterns decoded to fixed point by integer shifts, and the quantisers from
+  patterns (and E2M1, E4M3, UE8M0, binary32 as integer and exponent)
+  decoded to fixed point by integer shifts, and the quantisers from
   those bits to `TQ19Matrix`, `RowScaledTQ19` and `RowScaledTQ5` by exact
   rational rounding. No float type is involved.
   `matvec_batch_par_into` (0.6.7, on `TQ19Matrix`, `PlanarTQ19`,
