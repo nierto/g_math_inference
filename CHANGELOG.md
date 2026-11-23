@@ -3,6 +3,58 @@
 All notable changes to g_math_inference are documented in this file. Each
 release names the g_math version it was verified against.
 
+## [0.1.5] - 2026-11-24
+
+Every released result is unchanged unless a matrix is switched to
+`Rounding::Nearest`. Verified against g_math 0.7.3 to 0.7.5.
+
+### Added
+
+- **`Rounding { Default, Nearest }`** on `RowScaledTQ5`, `RowScaledTQ19`,
+  `TQ19Matrix`, `PlanarTQ19`, `HybridTQ19`, `NvFp4Matrix`, `MxFp8Matrix`
+  (`with_rounding`, `rounding`; `from_tq19` repacks keep the mode).
+  `Default` is the released rounding (floor for the row- and block-scaled
+  forms, toward zero for the TQ1.9 forms, two roundings in
+  `RowScaledTQ19`). `Nearest` rounds the exact value once to nearest, ties
+  toward +infinity, in every form (par, batch, batch_into, q2f): no half-unit
+  bias per output. The same speed.
+- **`matvec_wide_act(_par)`** on `NvFp4Matrix`, `MxFp8Matrix`,
+  `RowScaledTQ5`: activations at Q32.32 or Q64.64 (any i64 / i128 split),
+  the exact value rounded once at that format. The activations run as
+  exact 30-bit limbs through the 32-bit kernels (all-zero limbs skipped),
+  combined at 512 bits: a precision reference path. The i128 word gains the
+  wide epilogues, so `RowScaledTQ19` and the TQ1.9 `q2f` forms run at
+  Q64.64 through their generic methods.
+- **Activation quantisation, exact** (`quantize_nvfp4`, `quantize_mxfp8`,
+  `Nvfp4Activation`, `Mxfp8Activation`, and `matvec_quantized` on
+  `NvFp4Matrix` / `MxFp8Matrix`): the rule block-scaled checkpoints declare
+  for expert inputs (NVFP4: per-row `amax / 1536`, four-over-six block
+  scales chosen by the exact sum of absolute errors, a tie keeps 6, E2M1
+  and E4M3 nearest-even; MXFP8: the smallest power of two keeping every
+  element within 448), evaluated exactly in integers. The runtimes evaluate
+  it in binary32 and disagree on the operation order; this is the rule
+  itself, no float. `matvec_quantized` forms the exact sum over both
+  quantised operands, rounded once: a reference path for evaluating the
+  rule's effect on a model.
+
+### Changed
+
+- `matvec_batch_par(_into)` on `NvFp4Matrix` with few activations (up to 8
+  activation halves, the speculative-checking sizes) decodes each row once
+  in registers for all of them instead of through the scratch tile: the
+  same results; batch 2 at 2304 x 2304 287 -> ~240 us.
+
+### Validation
+
+- `tests/rounding_wide_validation.rs`: every form under `Nearest` and the
+  wide paths against 512-bit references from the stored weights; widened
+  32-bit activations equal to `matvec`. `tests/blockscaled_validation.rs`:
+  the Fraction references gain nearest values, every form checked under
+  both modes. `tests/actquant_validation.rs`: codes, scales and quantised
+  matvecs equal an independent Fraction implementation of the rule (48
+  rows; 137 blocks choose 4, 59 error ties keep 6, zero and subnormal block
+  scales reached; flipping the tie rule fails the gate).
+
 ## [0.1.4] - 2026-11-23
 
 Block-scaled weights computed on directly, exactly, in integers. Nothing

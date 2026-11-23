@@ -5,9 +5,10 @@
 
 use rayon::prelude::*;
 
+use super::exact::Rounding;
 use super::{SCALE, TRIT_DECODE_TABLE};
 use g_math::fixed_point::{Compute, Fixed, FixedNum};
-use g_math::fixed_point::{Storage, WideInt};
+use g_math::fixed_point::{Storage, WideInt, I256, I512};
 
 const STORAGE_OVERFLOW: &str = "tq19: result exceeds storage range";
 const ACC_OVERFLOW: &str = "tq19: accumulator exceeds compute-tier range";
@@ -119,9 +120,61 @@ pub trait WideOutput: TqWord {
     /// `floor(wide * s / 2^32)` at the compute tier for a Q32.32 row scale, fail-loud.
     #[doc(hidden)]
     fn rowscaled_scale_q2f(wide: Self::Compute, s_q32: u64) -> Self::Compute;
+    /// `acc * 2^F / SCALE` rounded to nearest (ties toward +infinity) at the
+    /// compute tier, fail-loud.
+    #[doc(hidden)]
+    fn wide_output_nearest<const F: u32>(acc: Self::Compute) -> Self::Compute;
+    /// The exact row-scaled value `acc * s / (SCALE * 2^32)` with `extra`
+    /// more fraction bits (0 or F), rounded once by `r` (floor as `Default`),
+    /// on the compute word, fail-loud.
+    #[doc(hidden)]
+    fn rowscaled_exact(acc: Self::Compute, s_q32: u64, extra: u32, r: Rounding) -> Self::Compute;
+}
+
+/// `3^9` as a reciprocal divisor (floor division without a 128-bit divide).
+const SCALE_DIV: crate::exact::FloorDiv = crate::exact::FloorDiv::new(SCALE as u64);
+
+/// `acc * s * 2^extra / (SCALE * 2^32)` rounded by `r`, at 512 bits.
+fn rowscaled_exact_i512(acc: I512, s_q32: u64, extra: u32, r: Rounding) -> I512 {
+    let n = (acc * I512::from(s_q32 as i128)) << extra as usize;
+    crate::exact::round_div_i512(n, I512::from(SCALE as i128) << 32usize, r)
+}
+
+/// `n / SCALE` to nearest, ties toward +infinity, at 512 bits.
+fn nearest_scale_i512(n: I512) -> I512 {
+    crate::exact::round_div_i512(n, I512::from(SCALE as i128), Rounding::Nearest)
+}
+
+/// The exact row-scaled value on a native `i128` product when it fits:
+/// `floor(p / (SCALE 2^(32 - extra)))` or its nearest (`floor(2x)` then
+/// `(+1) >> 1`), by the reciprocal of SCALE.
+#[inline(always)]
+fn rowscaled_exact_i128(p: i128, extra: u32, r: Rounding) -> i128 {
+    match r {
+        Rounding::Default => SCALE_DIV.floor(p >> (32 - extra)),
+        Rounding::Nearest => (SCALE_DIV.floor(p >> (31 - extra)) + 1) >> 1,
+    }
 }
 
 impl WideOutput for i32 {
+    fn wide_output_nearest<const F: u32>(acc: i64) -> i64 {
+        let n = (acc as i128) << F;
+        let s = SCALE as i128;
+        let q = (2 * n + s).div_euclid(2 * s);
+        i64::try_from(q).unwrap_or_else(|_| panic!("matvec_q2f: wide output exceeds compute-tier range"))
+    }
+    fn rowscaled_exact(acc: i64, s_q32: u64, extra: u32, r: Rounding) -> i64 {
+        let v = match (acc as i128).checked_mul(s_q32 as i128) {
+            Some(p) => rowscaled_exact_i128(p, extra, r),
+            None => {
+                let w = rowscaled_exact_i512(I512::from(acc as i128), s_q32, extra, r);
+                if w.fits_in_i128() { w.as_i128() } else { i128::MAX }
+            }
+        };
+        let fits = if extra == 0 { i32::try_from(v).is_ok() } else { i64::try_from(v).is_ok() };
+        assert!(fits, "RowScaledTQ19: scaled output exceeds range");
+        v as i64
+    }
     #[inline(always)]
     fn wide_output<const F: u32>(acc: i64) -> i64 {
         // i64 acc, i128 intermediate: acc * 2^F is exact, one division
@@ -150,6 +203,17 @@ impl WideOutput for i32 {
 }
 
 impl WideOutput for i64 {
+    fn wide_output_nearest<const F: u32>(acc: i128) -> i128 {
+        let v = nearest_scale_i512(I512::from(acc) << F as usize);
+        assert!(v.fits_in_i128(), "matvec_q2f: wide output exceeds compute-tier range");
+        v.as_i128()
+    }
+    fn rowscaled_exact(acc: i128, s_q32: u64, extra: u32, r: Rounding) -> i128 {
+        let v = rowscaled_exact_i512(I512::from(acc), s_q32, extra, r);
+        let lim = if extra == 0 { 63 } else { 127 };
+        assert!(v.fits_in_i128() && (v.as_i128() >> lim == 0 || v.as_i128() >> lim == -1), "RowScaledTQ19: scaled output exceeds range");
+        v.as_i128()
+    }
     #[inline(always)]
     fn wide_output<const F: u32>(acc: i128) -> i128 {
         // i128 acc: acc * 2^32 can overflow i128, so stage the single
@@ -180,6 +244,37 @@ impl WideOutput for i64 {
             Some(v) => v,
             None => panic!("RowScaledTQ19: q2f scaled output exceeds compute range"),
         }
+    }
+}
+
+/// The 128-bit word (Q64.64 activations): every epilogue at 512 bits.
+impl WideOutput for i128 {
+    fn wide_output<const F: u32>(acc: I256) -> I256 {
+        // truncation toward zero, as the narrower words
+        let v = (I512::from(acc) << F as usize) / I512::from(SCALE as i128);
+        assert!(v.fits_in_i256(), "matvec_q2f: wide output exceeds compute-tier range");
+        v.as_i256()
+    }
+    fn rowscaled_scale(dot: i128, s_q32: u64) -> i128 {
+        let v = (I512::from(dot) * I512::from(s_q32 as i128)) >> 32usize;
+        assert!(v.fits_in_i128(), "RowScaledTQ19: scaled output exceeds storage range");
+        v.as_i128()
+    }
+    fn rowscaled_scale_q2f(wide_dot: I256, s_q32: u64) -> I256 {
+        let v = (I512::from(wide_dot) * I512::from(s_q32 as i128)) >> 32usize;
+        assert!(v.fits_in_i256(), "RowScaledTQ19: q2f scaled output exceeds compute range");
+        v.as_i256()
+    }
+    fn wide_output_nearest<const F: u32>(acc: I256) -> I256 {
+        let v = nearest_scale_i512(I512::from(acc) << F as usize);
+        assert!(v.fits_in_i256(), "matvec_q2f: wide output exceeds compute-tier range");
+        v.as_i256()
+    }
+    fn rowscaled_exact(acc: I256, s_q32: u64, extra: u32, r: Rounding) -> I256 {
+        let v = rowscaled_exact_i512(I512::from(acc), s_q32, extra, r);
+        let fits = if extra == 0 { v.fits_in_i128() } else { v.fits_in_i256() };
+        assert!(fits, "RowScaledTQ19: scaled output exceeds range");
+        v.as_i256()
     }
 }
 
@@ -239,6 +334,63 @@ where
     Fixed<S, F>: FixedNum<Storage = S>,
 {
     S::wide_output::<F>(acc)
+}
+
+/// `acc / SCALE` on the compute word: toward zero (`Default`) or to nearest,
+/// ties toward +infinity.
+#[inline(always)]
+pub(super) fn div_scale<S: Storage>(acc: S::Compute, r: Rounding) -> S::Compute {
+    let scale = compute_scale::<S>();
+    match r {
+        Rounding::Default => acc.divmod(scale).0,
+        Rounding::Nearest => {
+            // floor((2 acc + SCALE) / (2 SCALE)); |acc| is far below the word
+            assert!(acc.magnitude_bit_length() + 2 < <S::Compute as WideInt>::BITS, "{}", ACC_OVERFLOW);
+            let two = scale.shl_bits(1);
+            let n = acc.shl_bits(1).checked_add_wide(scale).expect(ACC_OVERFLOW);
+            let (q, rem) = n.divmod(two);
+            if rem.is_negative() { q.checked_sub_wide(<S::Compute as WideInt>::one()).expect(ACC_OVERFLOW) } else { q }
+        }
+    }
+}
+
+/// [`wide_output`] under a rounding mode.
+#[inline(always)]
+pub(super) fn wide_output_r<S: WideOutput, const F: u32>(r: Rounding, acc: Compute<Fixed<S, F>>) -> Compute<Fixed<S, F>>
+where
+    Fixed<S, F>: FixedNum<Storage = S>,
+{
+    match r {
+        Rounding::Default => S::wide_output::<F>(acc),
+        Rounding::Nearest => S::wide_output_nearest::<F>(acc),
+    }
+}
+
+/// [`tq19_dot`] under a rounding mode.
+pub(crate) fn tq19_dot_r<S: TqWord, const F: u32>(weights: &[i16], activations: &[Fixed<S, F>], r: Rounding) -> Fixed<S, F>
+where
+    Fixed<S, F>: FixedNum<Storage = S>,
+{
+    debug_assert_eq!(weights.len(), activations.len());
+    narrow_to_storage::<S, F>(div_scale::<S>(tq19_dot_compute::<S, F>(weights, activations), r))
+}
+
+/// [`tq19_dot_q2f`] under a rounding mode.
+pub(crate) fn tq19_dot_q2f_r<S: WideOutput, const F: u32>(weights: &[i16], activations: &[Fixed<S, F>], r: Rounding) -> Compute<Fixed<S, F>>
+where
+    Fixed<S, F>: FixedNum<Storage = S>,
+{
+    debug_assert_eq!(weights.len(), activations.len());
+    wide_output_r::<S, F>(r, tq19_dot_compute::<S, F>(weights, activations))
+}
+
+/// The exact row sum `sum w_i * a_i` on the compute word (for epilogues that
+/// round the exact value once).
+pub(crate) fn tq19_dot_exact_sum<S: TqWord, const F: u32>(weights: &[i16], activations: &[Fixed<S, F>]) -> Compute<Fixed<S, F>>
+where
+    Fixed<S, F>: FixedNum<Storage = S>,
+{
+    tq19_dot_compute::<S, F>(weights, activations)
 }
 
 /// `round(acc * scale / 2^F)` to storage (nearest, ties toward +inf), fail-loud.
@@ -380,16 +532,16 @@ pub fn tq19_matvec<S: TqWord, const F: u32>(
     rows: usize,
     cols: usize,
     activations: &[Fixed<S, F>],
+    r: Rounding,
 ) -> Vec<Fixed<S, F>>
 where
     Fixed<S, F>: FixedNum<Storage = S>,
 {
-    let scale = compute_scale::<S>();
     (0..rows)
         .map(|row| {
             let row_weights = &data[row * cols..(row + 1) * cols];
             let acc = tq19_dot_compute::<S, F>(row_weights, activations);
-            narrow_to_storage::<S, F>(acc.divmod(scale).0)
+            narrow_to_storage::<S, F>(div_scale::<S>(acc, r))
         })
         .collect()
 }
@@ -416,15 +568,15 @@ pub fn tq19_matvec_batch<S: TqWord, const F: u32>(
     rows: usize,
     cols: usize,
     batch: &[&[Fixed<S, F>]],
+    r: Rounding,
 ) -> Vec<Vec<Fixed<S, F>>>
 where
     Fixed<S, F>: FixedNum<Storage = S>,
 {
     if !unchecked_sum_fits::<S>(cols) {
-        return batch.iter().map(|x| tq19_matvec(data, rows, cols, &x[..cols])).collect();
+        return batch.iter().map(|x| tq19_matvec(data, rows, cols, &x[..cols], r)).collect();
     }
     let batch_size = batch.len();
-    let scale = compute_scale::<S>();
     let mut results: Vec<Vec<Fixed<S, F>>> = (0..batch_size)
         .map(|_| Vec::with_capacity(rows))
         .collect();
@@ -458,7 +610,7 @@ where
 
         // Finalize: divide by SCALE, narrow, store
         for b in 0..batch_size {
-            results[b].push(narrow_to_storage::<S, F>(accs[b].divmod(scale).0));
+            results[b].push(narrow_to_storage::<S, F>(div_scale::<S>(accs[b], r)));
         }
     }
 
@@ -474,6 +626,7 @@ pub fn tq19_matvec_q2f<S: WideOutput, const F: u32>(
     rows: usize,
     cols: usize,
     activations: &[Fixed<S, F>],
+    r: Rounding,
 ) -> Vec<Compute<Fixed<S, F>>>
 where
     Fixed<S, F>: FixedNum<Storage = S>,
@@ -481,7 +634,7 @@ where
     (0..rows)
         .map(|row| {
             let row_weights = &data[row * cols..(row + 1) * cols];
-            wide_output::<S, F>(tq19_dot_compute::<S, F>(row_weights, activations))
+            wide_output_r::<S, F>(r, tq19_dot_compute::<S, F>(row_weights, activations))
         })
         .collect()
 }
@@ -521,17 +674,17 @@ pub fn tq19_matvec_par<S: TqWord, const F: u32>(
     rows: usize,
     cols: usize,
     activations: &[Fixed<S, F>],
+    r: Rounding,
 ) -> Vec<Fixed<S, F>>
 where
     Fixed<S, F>: FixedNum<Storage = S>,
 {
-    let scale = compute_scale::<S>();
     (0..rows)
         .into_par_iter()
         .map(|row| {
             let row_weights = &data[row * cols..(row + 1) * cols];
             let acc = tq19_dot_compute::<S, F>(row_weights, activations);
-            narrow_to_storage::<S, F>(acc.divmod(scale).0)
+            narrow_to_storage::<S, F>(div_scale::<S>(acc, r))
         })
         .collect()
 }
@@ -544,6 +697,7 @@ pub fn tq19_matvec_q2f_par<S: WideOutput, const F: u32>(
     rows: usize,
     cols: usize,
     activations: &[Fixed<S, F>],
+    r: Rounding,
 ) -> Vec<Compute<Fixed<S, F>>>
 where
     Fixed<S, F>: FixedNum<Storage = S>,
@@ -552,7 +706,7 @@ where
         .into_par_iter()
         .map(|row| {
             let row_weights = &data[row * cols..(row + 1) * cols];
-            wide_output::<S, F>(tq19_dot_compute::<S, F>(row_weights, activations))
+            wide_output_r::<S, F>(r, tq19_dot_compute::<S, F>(row_weights, activations))
         })
         .collect()
 }
@@ -564,12 +718,13 @@ pub fn tq19_matvec_q2f_batch_par<S: WideOutput, const F: u32>(
     rows: usize,
     cols: usize,
     batch: &[&[Fixed<S, F>]],
+    r: Rounding,
 ) -> Vec<Vec<Compute<Fixed<S, F>>>>
 where
     Fixed<S, F>: FixedNum<Storage = S>,
 {
     if !unchecked_sum_fits::<S>(cols) {
-        return batch.iter().map(|x| tq19_matvec_q2f_par(data, rows, cols, &x[..cols])).collect();
+        return batch.iter().map(|x| tq19_matvec_q2f_par(data, rows, cols, &x[..cols], r)).collect();
     }
     let batch_size = batch.len();
     let row_results: Vec<Vec<Compute<Fixed<S, F>>>> = (0..rows)
@@ -589,7 +744,7 @@ where
                 }
                 tile_start = tile_end;
             }
-            accs.into_iter().map(wide_output::<S, F>).collect()
+            accs.into_iter().map(|a| wide_output_r::<S, F>(r, a)).collect()
         })
         .collect();
     let mut results: Vec<Vec<Compute<Fixed<S, F>>>> = (0..batch_size)
@@ -655,6 +810,7 @@ pub(crate) fn tq19_matvec_batch_par_into<S: TqWord, const F: u32>(
     cols: usize,
     batch: &[&[Fixed<S, F>]],
     out: &mut [Fixed<S, F>],
+    r: Rounding,
 )
 where
     Fixed<S, F>: FixedNum<Storage = S>,
@@ -663,11 +819,10 @@ where
     assert_eq!(out.len(), batch_size * rows, "tq19_matvec_batch_par_into: out length is not batch.len() * rows");
     if !unchecked_sum_fits::<S>(cols) {
         for (x, o) in batch.iter().zip(out.chunks_exact_mut(rows.max(1))) {
-            o.copy_from_slice(&tq19_matvec_par(data, rows, cols, &x[..cols]));
+            o.copy_from_slice(&tq19_matvec_par(data, rows, cols, &x[..cols], r));
         }
         return;
     }
-    let scale = compute_scale::<S>();
     let sink = BatchOut::new(out, rows, batch_size, "tq19_matvec_batch_par_into");
     (0..rows).into_par_iter().for_each_init(
         || vec![compute_zero::<S>(); batch_size],
@@ -692,7 +847,7 @@ where
 
             for (b, acc) in accs.iter().enumerate() {
                 // SAFETY: this task is the only one writing row `row`.
-                unsafe { sink.write(b, row, narrow_to_storage::<S, F>((*acc).divmod(scale).0)) };
+                unsafe { sink.write(b, row, narrow_to_storage::<S, F>(div_scale::<S>(*acc, r))) };
             }
         },
     );
@@ -707,15 +862,15 @@ pub fn tq19_matvec_batch_par<S: TqWord, const F: u32>(
     rows: usize,
     cols: usize,
     batch: &[&[Fixed<S, F>]],
+    r: Rounding,
 ) -> Vec<Vec<Fixed<S, F>>>
 where
     Fixed<S, F>: FixedNum<Storage = S>,
 {
     if !unchecked_sum_fits::<S>(cols) {
-        return batch.iter().map(|x| tq19_matvec_par(data, rows, cols, &x[..cols])).collect();
+        return batch.iter().map(|x| tq19_matvec_par(data, rows, cols, &x[..cols], r)).collect();
     }
     let batch_size = batch.len();
-    let scale = compute_scale::<S>();
 
     // Parallel: each row produces batch_size results with tiled accumulation
     let row_results: Vec<Vec<Fixed<S, F>>> = (0..rows)
@@ -740,7 +895,7 @@ where
             }
 
             accs.into_iter()
-                .map(|acc| narrow_to_storage::<S, F>(acc.divmod(scale).0))
+                .map(|acc| narrow_to_storage::<S, F>(div_scale::<S>(acc, r)))
                 .collect()
         })
         .collect();
@@ -846,15 +1001,15 @@ mod tests {
                     let x: Vec<BinaryStorage> = (0..cols)
                         .map(|i| ((i as i64 * 40503 % 8191) - 4095) as BinaryStorage)
                         .collect();
-                    let narrow = tq19_matvec(&data, rows, cols, FixedPoint::from_raw_slice(&x));
-                    let wide = tq19_matvec_q2f(&data, rows, cols, FixedPoint::from_raw_slice(&x));
+                    let narrow = tq19_matvec(&data, rows, cols, FixedPoint::from_raw_slice(&x), crate::exact::Rounding::Default);
+                    let wide = tq19_matvec_q2f(&data, rows, cols, FixedPoint::from_raw_slice(&x), crate::exact::Rounding::Default);
                     for r in 0..rows {
                         assert_eq!(narrow_q2f(wide[r]), narrow[r].raw(), "row {r}: narrow(q2f) != matvec");
                     }
                     // Parallel and batch variants must agree with sequential exactly.
-                    assert_eq!(wide, tq19_matvec_q2f_par(&data, rows, cols, FixedPoint::from_raw_slice(&x)));
+                    assert_eq!(wide, tq19_matvec_q2f_par(&data, rows, cols, FixedPoint::from_raw_slice(&x), crate::exact::Rounding::Default));
                     let batch: Vec<&[BinaryStorage]> = vec![&x, &x];
-                    let wb = tq19_matvec_q2f_batch_par(&data, rows, cols, &(&batch).iter().map(|v| FixedPoint::from_raw_slice(v)).collect::<Vec<_>>());
+                    let wb = tq19_matvec_q2f_batch_par(&data, rows, cols, &(&batch).iter().map(|v| FixedPoint::from_raw_slice(v)).collect::<Vec<_>>(), crate::exact::Rounding::Default);
                     assert_eq!(wb[0], wide);
                     assert_eq!(wb[1], wide);
                 }
@@ -940,7 +1095,7 @@ mod tests {
                         data[i * n + i] = SCALE as i16;
                     }
                     let activations: Vec<BinaryStorage> = vec![fp_raw("1.0"), fp_raw("2.0"), fp_raw("3.0")];
-                    let result = tq19_matvec(&data, n, n, FixedPoint::from_raw_slice(&activations));
+                    let result = tq19_matvec(&data, n, n, FixedPoint::from_raw_slice(&activations), crate::exact::Rounding::Default);
                     for i in 0..n {
                         let diff = if result[i] > FixedPoint::from_raw(activations[i]) { result[i] - FixedPoint::from_raw(activations[i]) }
                             else { FixedPoint::from_raw(activations[i]) - result[i] };
@@ -955,9 +1110,9 @@ mod tests {
                     let v1: Vec<BinaryStorage> = (0..n).map(|i| fp_raw(&format!("{}.5", i))).collect();
                     let v2: Vec<BinaryStorage> = (0..n).map(|i| fp_raw(&format!("{}.25", i + 1))).collect();
 
-                    let seq1 = tq19_matvec(&data, n, n, FixedPoint::from_raw_slice(&v1));
-                    let seq2 = tq19_matvec(&data, n, n, FixedPoint::from_raw_slice(&v2));
-                    let batch = tq19_matvec_batch(&data, n, n, &[FixedPoint::from_raw_slice(&v1), FixedPoint::from_raw_slice(&v2)]);
+                    let seq1 = tq19_matvec(&data, n, n, FixedPoint::from_raw_slice(&v1), crate::exact::Rounding::Default);
+                    let seq2 = tq19_matvec(&data, n, n, FixedPoint::from_raw_slice(&v2), crate::exact::Rounding::Default);
+                    let batch = tq19_matvec_batch(&data, n, n, &[FixedPoint::from_raw_slice(&v1), FixedPoint::from_raw_slice(&v2)], crate::exact::Rounding::Default);
 
                     assert_eq!(batch[0], seq1, "batch[0] must match sequential");
                     assert_eq!(batch[1], seq2, "batch[1] must match sequential");

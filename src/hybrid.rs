@@ -27,8 +27,9 @@
 //! Matvec is bit-identical to [`TQ19Matrix::matvec`]: rows are reconstructed
 //! to their exact i16 weights, then the standard `tq19_dot` runs.
 
-use super::ops::tq19_dot;
-use super::ops::tq19_dot_q2f;
+use super::ops::tq19_dot_r;
+use super::ops::tq19_dot_q2f_r;
+use super::exact::Rounding;
 use super::{TQ19Matrix, MAX_RAW, MIN_RAW};
 use g_math::fixed_point::{Compute, Fixed, FixedNum};
 use super::ops::{TqWord, WideOutput};
@@ -75,6 +76,8 @@ pub struct HybridTQ19 {
     hi_cols: Vec<u32>,
     /// High correction values (multiplied by 3^7 at reconstruction).
     hi_vals: Vec<i8>,
+    /// Output rounding (see [`Rounding`]).
+    rounding: Rounding,
 }
 
 /// Split a raw TQ1.9 value into (hi, biased_lo).
@@ -90,6 +93,17 @@ fn split_raw(raw: i16) -> (i8, u16) {
 }
 
 impl HybridTQ19 {
+    /// The same matrix rounding its outputs by `rounding` (see [`Rounding`]).
+    pub fn with_rounding(mut self, rounding: Rounding) -> Self {
+        self.rounding = rounding;
+        self
+    }
+
+    /// The rounding mode applied to every output.
+    pub fn rounding(&self) -> Rounding {
+        self.rounding
+    }
+
     /// Convert a dense [`TQ19Matrix`] (lossless; see `to_tq19`).
     pub fn from_tq19(m: &TQ19Matrix) -> Self {
         let rows = m.rows();
@@ -134,7 +148,7 @@ impl HybridTQ19 {
             hi_row_ptr.push(hi_cols.len() as u32);
         }
 
-        Self { rows, cols, packed, hi_row_ptr, hi_cols, hi_vals }
+        Self { rows, cols, packed, hi_row_ptr, hi_cols, hi_vals, rounding: m.rounding() }
     }
 
     /// Reconstruct the original dense [`TQ19Matrix`] (lossless inverse).
@@ -187,7 +201,7 @@ impl HybridTQ19 {
         hi_cols: Vec<u32>,
         hi_vals: Vec<i8>,
     ) -> Self {
-        Self { rows, cols, packed, hi_row_ptr, hi_cols, hi_vals }
+        Self { rows, cols, packed, hi_row_ptr, hi_cols, hi_vals, rounding: Rounding::Default }
     }
 
     // ========================================================================
@@ -284,7 +298,7 @@ impl HybridTQ19 {
         (0..self.rows)
             .map(|row| {
                 self.reconstruct_row_into(row, &mut buf);
-                tq19_dot(&buf[..self.cols], activations)
+                tq19_dot_r(&buf[..self.cols], activations, self.rounding)
             })
             .collect()
     }
@@ -305,7 +319,7 @@ impl HybridTQ19 {
                 || vec![0i16; self.buf_len()],
                 |buf, row| {
                     self.reconstruct_row_into(row, buf);
-                    tq19_dot(&buf[..self.cols], activations)
+                    tq19_dot_r(&buf[..self.cols], activations, self.rounding)
                 },
             )
             .collect()
@@ -331,7 +345,7 @@ impl HybridTQ19 {
             .map(|row| {
                 self.reconstruct_row_into(row, &mut buf);
                 let w = &buf[..self.cols];
-                batch.iter().map(|acts| tq19_dot(w, acts)).collect()
+                batch.iter().map(|acts| tq19_dot_r(w, acts, self.rounding)).collect()
             })
             .collect();
         transpose(by_row, batch.len())
@@ -356,7 +370,7 @@ impl HybridTQ19 {
                 |buf, row| {
                     self.reconstruct_row_into(row, buf);
                     let w = &buf[..self.cols];
-                    batch.iter().map(|acts| tq19_dot(w, acts)).collect()
+                    batch.iter().map(|acts| tq19_dot_r(w, acts, self.rounding)).collect()
                 },
             )
             .collect();
@@ -390,7 +404,7 @@ impl HybridTQ19 {
                 let w = &buf[..self.cols];
                 for (b, acts) in batch.iter().enumerate() {
                     // SAFETY: this task is the only one writing row `row`.
-                    unsafe { sink.write(b, row, tq19_dot(w, acts)) };
+                    unsafe { sink.write(b, row, tq19_dot_r(w, acts, self.rounding)) };
                 }
             },
         );
@@ -412,7 +426,7 @@ impl HybridTQ19 {
         (0..self.rows)
             .map(|row| {
                 self.reconstruct_row_into(row, &mut buf);
-                tq19_dot_q2f(&buf[..self.cols], activations)
+                tq19_dot_q2f_r(&buf[..self.cols], activations, self.rounding)
             })
             .collect()
     }
@@ -429,7 +443,7 @@ impl HybridTQ19 {
                 || vec![0i16; self.buf_len()],
                 |buf, row| {
                     self.reconstruct_row_into(row, buf);
-                    tq19_dot_q2f(&buf[..self.cols], activations)
+                    tq19_dot_q2f_r(&buf[..self.cols], activations, self.rounding)
                 },
             )
             .collect()
@@ -450,7 +464,7 @@ impl HybridTQ19 {
                 |buf, row| {
                     self.reconstruct_row_into(row, buf);
                     let w = &buf[..self.cols];
-                    batch.iter().map(|acts| tq19_dot_q2f(w, acts)).collect()
+                    batch.iter().map(|acts| tq19_dot_q2f_r(w, acts, self.rounding)).collect()
                 },
             )
             .collect();

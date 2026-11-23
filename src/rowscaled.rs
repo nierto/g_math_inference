@@ -18,15 +18,15 @@
 //! with an i128 multiply and >>32 arithmetic shift. Fully deterministic;
 //! truncation error ≤ ~1.5 storage units per output element.
 //!
-//! Profile support: q16_16 (realtime) and q32_32 (compact): the i128
-//! multiply covers Fixed<S, F> = i32/i64. Wider profiles need bigint
-//! scale arithmetic and are deliberately not implemented yet.
+//! Words: i32 and i64 activations on native i128 scale arithmetic, i128
+//! activations (Q64.64) at 512 bits.
 
 
 use super::ops;
 use super::MAX_RAW;
 use g_math::fixed_point::{Compute, Fixed, FixedNum};
 use super::ops::WideOutput;
+use super::exact::Rounding;
 
 use rayon::prelude::*;
 
@@ -39,6 +39,8 @@ pub struct RowScaledTQ19 {
     data: Vec<i16>,
     /// Per-row relative scale `s_row × SCALE` in unsigned Q32.32.
     scales_q32: Vec<u64>,
+    /// Output rounding (see [`Rounding`]).
+    rounding: Rounding,
 }
 
 impl RowScaledTQ19 {
@@ -48,7 +50,45 @@ impl RowScaledTQ19 {
         assert_eq!(data.len(), rows * cols, "RowScaledTQ19: data length mismatch");
         assert_eq!(scales_q32.len(), rows, "RowScaledTQ19: scales length mismatch");
         debug_assert!(data.iter().all(|&w| (w as i32).abs() <= MAX_RAW as i32));
-        Self { rows, cols, data, scales_q32 }
+        Self { rows, cols, data, scales_q32, rounding: Rounding::Default }
+    }
+
+    /// The same matrix rounding its outputs by `rounding`. `Nearest` rounds
+    /// the exact value `sum(raw * x) * s / (SCALE * 2^32)` once; `Default`
+    /// keeps the released two roundings (the dot, then the row scale).
+    pub fn with_rounding(mut self, rounding: Rounding) -> Self {
+        self.rounding = rounding;
+        self
+    }
+
+    /// The rounding mode applied to every output.
+    pub fn rounding(&self) -> Rounding { self.rounding }
+
+    /// One output row at storage under the matrix's rounding.
+    #[inline(always)]
+    fn row_out<S: WideOutput, const F: u32>(&self, row: &[i16], x: &[Fixed<S, F>], s_q32: u64) -> Fixed<S, F>
+    where
+        Fixed<S, F>: FixedNum<Storage = S>,
+    {
+        match self.rounding {
+            Rounding::Default => Self::scale_row(ops::tq19_dot(row, x), s_q32),
+            Rounding::Nearest => {
+                let v = S::rowscaled_exact(ops::tq19_dot_exact_sum(row, x), s_q32, 0, Rounding::Nearest);
+                Fixed::from_raw(S::narrow(v).unwrap_or_else(|| panic!("RowScaledTQ19: scaled output exceeds storage range")))
+            }
+        }
+    }
+
+    /// One output row at 2F fraction bits under the matrix's rounding.
+    #[inline(always)]
+    fn row_out_q2f<S: WideOutput, const F: u32>(&self, row: &[i16], x: &[Fixed<S, F>], s_q32: u64) -> Compute<Fixed<S, F>>
+    where
+        Fixed<S, F>: FixedNum<Storage = S>,
+    {
+        match self.rounding {
+            Rounding::Default => Self::scale_row_q2f::<S, F>(ops::tq19_dot_q2f(row, x), s_q32),
+            Rounding::Nearest => S::rowscaled_exact(ops::tq19_dot_exact_sum(row, x), s_q32, F, Rounding::Nearest),
+        }
     }
 
     pub fn rows(&self) -> usize { self.rows }
@@ -78,7 +118,7 @@ impl RowScaledTQ19 {
         (0..self.rows)
             .map(|r| {
                 let row = &self.data[r * self.cols..(r + 1) * self.cols];
-                Self::scale_row(ops::tq19_dot(row, activations), self.scales_q32[r])
+                self.row_out(row, activations, self.scales_q32[r])
             })
             .collect()
     }
@@ -93,7 +133,7 @@ impl RowScaledTQ19 {
             .into_par_iter()
             .map(|r| {
                 let row = &self.data[r * self.cols..(r + 1) * self.cols];
-                Self::scale_row(ops::tq19_dot(row, activations), self.scales_q32[r])
+                self.row_out(row, activations, self.scales_q32[r])
             })
             .collect()
     }
@@ -126,7 +166,7 @@ impl RowScaledTQ19 {
         (0..self.rows)
             .map(|r| {
                 let row = &self.data[r * self.cols..(r + 1) * self.cols];
-                Self::scale_row_q2f::<S, F>(ops::tq19_dot_q2f(row, activations), self.scales_q32[r])
+                self.row_out_q2f(row, activations, self.scales_q32[r])
             })
             .collect()
     }
@@ -141,7 +181,7 @@ impl RowScaledTQ19 {
             .into_par_iter()
             .map(|r| {
                 let row = &self.data[r * self.cols..(r + 1) * self.cols];
-                Self::scale_row_q2f::<S, F>(ops::tq19_dot_q2f(row, activations), self.scales_q32[r])
+                self.row_out_q2f(row, activations, self.scales_q32[r])
             })
             .collect()
     }
@@ -161,7 +201,7 @@ impl RowScaledTQ19 {
                 let s = self.scales_q32[r];
                 batch
                     .iter()
-                    .map(|x| Self::scale_row_q2f::<S, F>(ops::tq19_dot_q2f(row, x), s))
+                    .map(|x| self.row_out_q2f(row, x, s))
                     .collect()
             })
             .collect();
@@ -191,7 +231,7 @@ impl RowScaledTQ19 {
             let s = self.scales_q32[r];
             for (b, x) in batch.iter().enumerate() {
                 // SAFETY: this task is the only one writing row `r`.
-                unsafe { sink.write(b, r, Self::scale_row(ops::tq19_dot(row, x), s)) };
+                unsafe { sink.write(b, r, self.row_out(row, x, s)) };
             }
         });
     }
@@ -211,7 +251,7 @@ impl RowScaledTQ19 {
                 let s = self.scales_q32[r];
                 batch
                     .iter()
-                    .map(|x| Self::scale_row(ops::tq19_dot(row, x), s))
+                    .map(|x| self.row_out(row, x, s))
                     .collect()
             })
             .collect();

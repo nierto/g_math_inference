@@ -125,19 +125,21 @@ fn blockscaled() {
         let x = activation(&mut rng, cols);
         let xs: Vec<Vec<Fx>> = (0..64).map(|_| activation(&mut rng, cols)).collect();
         let refs: Vec<&[Fx]> = xs.iter().map(|v| &v[..]).collect();
-        let modes: [(&str, usize); 3] = [("matvec (1 thread)", 40), ("matvec_par", 200), ("matvec_batch_par b64", 12)];
-        for (mode, reps) in modes {
+        // (label, batch size: 0 = matvec on one thread, 1 = matvec_par, k = matvec_batch_par with k activations)
+        let modes: [(&str, usize, usize); 8] = [("matvec (1 thread)", 0, 40), ("matvec_par", 1, 200), ("batch 2", 2, 100), ("batch 3", 3, 100), ("batch 4", 4, 100), ("batch 8", 8, 60), ("batch 16", 16, 40), ("batch 64", 64, 12)];
+        for (mode, bs, reps) in modes {
             let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+            let sub = &refs[..bs.max(1)];
             for i in 0..reps + 3 {
                 let k = i % K;
                 let t = Instant::now();
-                match mode { "matvec (1 thread)" => { black_box(tq[k].matvec(black_box(&x))); } "matvec_par" => { black_box(tq[k].matvec_par(black_box(&x))); } _ => { black_box(tq[k].matvec_batch_par(black_box(&refs))); } }
+                match bs { 0 => { black_box(tq[k].matvec(black_box(&x))); } 1 => { black_box(tq[k].matvec_par(black_box(&x))); } _ => { black_box(tq[k].matvec_batch_par(black_box(sub))); } }
                 let ta = t.elapsed().as_nanos() as f64;
                 let t = Instant::now();
-                match mode { "matvec (1 thread)" => { black_box(nv[k].matvec(black_box(&x))); } "matvec_par" => { black_box(nv[k].matvec_par(black_box(&x))); } _ => { black_box(nv[k].matvec_batch_par(black_box(&refs))); } }
+                match bs { 0 => { black_box(nv[k].matvec(black_box(&x))); } 1 => { black_box(nv[k].matvec_par(black_box(&x))); } _ => { black_box(nv[k].matvec_batch_par(black_box(sub))); } }
                 let tb = t.elapsed().as_nanos() as f64;
                 let t = Instant::now();
-                match mode { "matvec (1 thread)" => { black_box(mx[k].matvec(black_box(&x))); } "matvec_par" => { black_box(mx[k].matvec_par(black_box(&x))); } _ => { black_box(mx[k].matvec_batch_par(black_box(&refs))); } }
+                match bs { 0 => { black_box(mx[k].matvec(black_box(&x))); } 1 => { black_box(mx[k].matvec_par(black_box(&x))); } _ => { black_box(mx[k].matvec_batch_par(black_box(sub))); } }
                 let tc = t.elapsed().as_nanos() as f64;
                 if i >= 3 { a.push(ta); b.push(tb); c.push(tc); }
             }

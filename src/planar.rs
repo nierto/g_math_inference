@@ -28,8 +28,9 @@
 //! is the same integer as [`TQ19Matrix::matvec`] computes, so the single
 //! truncating division by SCALE yields the same result on every profile.
 
-use super::ops::tq19_dot;
-use super::ops::tq19_dot_q2f;
+use super::ops::tq19_dot_r;
+use super::ops::tq19_dot_q2f_r;
+use super::exact::Rounding;
 use super::{TQ19Matrix, MAX_RAW, MIN_RAW, TRIT_DECODE_TABLE};
 use g_math::fixed_point::{Compute, Fixed, FixedNum};
 use super::ops::{TqWord, WideOutput};
@@ -143,6 +144,8 @@ pub struct PlanarTQ19 {
     cols: usize,
     /// `planes[k]` holds digit position k (weight 3^k).
     planes: [PlaneData; NUM_PLANES],
+    /// Output rounding (see [`Rounding`]).
+    rounding: Rounding,
 }
 
 /// Extract all 10 balanced-ternary digits of a TQ1.9 raw value.
@@ -167,6 +170,17 @@ fn bt_digits(raw: i16) -> [i8; NUM_PLANES] {
 }
 
 impl PlanarTQ19 {
+    /// The same matrix rounding its outputs by `rounding` (see [`Rounding`]).
+    pub fn with_rounding(mut self, rounding: Rounding) -> Self {
+        self.rounding = rounding;
+        self
+    }
+
+    /// The rounding mode applied to every output.
+    pub fn rounding(&self) -> Rounding {
+        self.rounding
+    }
+
     /// Decompose a [`TQ19Matrix`] into trit planes.
     ///
     /// Lossless: [`PlanarTQ19::to_tq19`] reconstructs the input exactly, and
@@ -297,7 +311,7 @@ impl PlanarTQ19 {
             };
         }
 
-        Self { rows, cols, planes }
+        Self { rows, cols, planes, rounding: m.rounding() }
     }
 
     /// Reconstruct the original dense [`TQ19Matrix`] (lossless inverse).
@@ -366,7 +380,7 @@ impl PlanarTQ19 {
     /// [`PlanarTQ19::from_tq19`] (or an equivalent encoder) for a matrix of
     /// the given shape.
     pub fn from_parts(rows: usize, cols: usize, planes: [PlaneData; NUM_PLANES]) -> Self {
-        Self { rows, cols, planes }
+        Self { rows, cols, planes, rounding: Rounding::Default }
     }
 
     /// Total heap bytes of plane storage.
@@ -478,7 +492,7 @@ impl PlanarTQ19 {
         (0..self.rows)
             .map(|row| {
                 self.reconstruct_row_into(row, &mut buf);
-                tq19_dot(&buf[..self.cols], activations)
+                tq19_dot_r(&buf[..self.cols], activations, self.rounding)
             })
             .collect()
     }
@@ -499,7 +513,7 @@ impl PlanarTQ19 {
                 || vec![0i16; self.buf_len()],
                 |buf, row| {
                     self.reconstruct_row_into(row, buf);
-                    tq19_dot(&buf[..self.cols], activations)
+                    tq19_dot_r(&buf[..self.cols], activations, self.rounding)
                 },
             )
             .collect()
@@ -528,7 +542,7 @@ impl PlanarTQ19 {
             .map(|row| {
                 self.reconstruct_row_into(row, &mut buf);
                 let w = &buf[..self.cols];
-                batch.iter().map(|acts| tq19_dot(w, acts)).collect()
+                batch.iter().map(|acts| tq19_dot_r(w, acts, self.rounding)).collect()
             })
             .collect();
         transpose(results_by_row, batch.len())
@@ -554,7 +568,7 @@ impl PlanarTQ19 {
                 |buf, row| {
                     self.reconstruct_row_into(row, buf);
                     let w = &buf[..self.cols];
-                    batch.iter().map(|acts| tq19_dot(w, acts)).collect()
+                    batch.iter().map(|acts| tq19_dot_r(w, acts, self.rounding)).collect()
                 },
             )
             .collect();
@@ -588,7 +602,7 @@ impl PlanarTQ19 {
                 let w = &buf[..self.cols];
                 for (b, acts) in batch.iter().enumerate() {
                     // SAFETY: this task is the only one writing row `row`.
-                    unsafe { sink.write(b, row, tq19_dot(w, acts)) };
+                    unsafe { sink.write(b, row, tq19_dot_r(w, acts, self.rounding)) };
                 }
             },
         );
@@ -610,7 +624,7 @@ impl PlanarTQ19 {
         (0..self.rows)
             .map(|row| {
                 self.reconstruct_row_into(row, &mut buf);
-                tq19_dot_q2f(&buf[..self.cols], activations)
+                tq19_dot_q2f_r(&buf[..self.cols], activations, self.rounding)
             })
             .collect()
     }
@@ -627,7 +641,7 @@ impl PlanarTQ19 {
                 || vec![0i16; self.buf_len()],
                 |buf, row| {
                     self.reconstruct_row_into(row, buf);
-                    tq19_dot_q2f(&buf[..self.cols], activations)
+                    tq19_dot_q2f_r(&buf[..self.cols], activations, self.rounding)
                 },
             )
             .collect()
@@ -648,7 +662,7 @@ impl PlanarTQ19 {
                 |buf, row| {
                     self.reconstruct_row_into(row, buf);
                     let w = &buf[..self.cols];
-                    batch.iter().map(|acts| tq19_dot_q2f(w, acts)).collect()
+                    batch.iter().map(|acts| tq19_dot_q2f_r(w, acts, self.rounding)).collect()
                 },
             )
             .collect();

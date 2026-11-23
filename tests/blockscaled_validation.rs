@@ -16,7 +16,7 @@ mod refs;
 
 use g_math::fixed_point::Fixed;
 use g_math_inference::bits::{decompose_e4m3, decompose_f32, e2m1_x2, ue8m0_exponent};
-use g_math_inference::{MxFp8Matrix, NvFp4Matrix};
+use g_math_inference::{MxFp8Matrix, NvFp4Matrix, Rounding};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 fn silence() {
@@ -127,6 +127,13 @@ fn nvfp4_equals_fraction_references_row_by_row() {
             10 => check_forms!(&m, 10, c.x, c.out, c.q2f, what),
             _ => check_forms!(&m, 16, c.x, c.out, c.q2f, what),
         }
+        // the same matrix rounding to nearest (ties toward +infinity)
+        let mn = m.clone().with_rounding(Rounding::Nearest);
+        let wn = format!("{what} nearest");
+        match c.frac {
+            10 => check_forms!(&mn, 10, c.x, c.near, c.q2f_near, wn),
+            _ => check_forms!(&mn, 16, c.x, c.near, c.q2f_near, wn),
+        }
         // one row at a time: each row's own value or panic
         for r in 0..c.rows {
             let (h, s) = (c.cols / 2, c.cols / 16);
@@ -153,6 +160,12 @@ fn mxfp8_equals_fraction_references_row_by_row() {
         match c.frac {
             10 => check_forms!(&m, 10, c.x, c.out, c.q2f, what),
             _ => check_forms!(&m, 16, c.x, c.out, c.q2f, what),
+        }
+        let mn = m.clone().with_rounding(Rounding::Nearest);
+        let wn = format!("{what} nearest");
+        match c.frac {
+            10 => check_forms!(&mn, 10, c.x, c.near, c.q2f_near, wn),
+            _ => check_forms!(&mn, 16, c.x, c.near, c.q2f_near, wn),
         }
         for r in 0..c.rows {
             let s = c.cols / 32;

@@ -17,6 +17,7 @@
 
 
 use g_math::fixed_point::{Fixed, FixedNum};
+use crate::exact::Rounding;
 use rayon::prelude::*;
 
 /// Largest code: `(3^5 - 1) / 2`.
@@ -33,6 +34,8 @@ pub struct RowScaledTQ5 {
     cols: usize,
     data: Vec<i8>,
     scales_q32: Vec<u64>,
+    /// Output rounding (see [`Rounding`]).
+    rounding: Rounding,
 }
 
 /// An activation vector split into signed 16-bit halves: `x = hi * 65536 + lo` exactly.
@@ -253,7 +256,17 @@ impl RowScaledTQ5 {
             cols,
             data,
             scales_q32,
+            rounding: Rounding::Default,
         }
+    }
+    /// The same matrix rounding its outputs by `rounding` (see [`Rounding`]).
+    pub fn with_rounding(mut self, rounding: Rounding) -> Self {
+        self.rounding = rounding;
+        self
+    }
+    /// The rounding mode applied to every output.
+    pub fn rounding(&self) -> Rounding {
+        self.rounding
     }
     pub fn rows(&self) -> usize {
         self.rows
@@ -318,10 +331,15 @@ impl RowScaledTQ5 {
         Self::dot(row, x)
     }
 
-    /// `floor(acc * s / 2^32)` narrowed to storage; fails loud on overflow.
+    /// `acc * s / 2^32` rounded by the matrix's mode (floor as `Default`),
+    /// narrowed to storage; fails loud on overflow.
     #[inline(always)]
-    fn scale_row(acc: i64, s_q32: u64) -> i32 {
-        let scaled = (acc as i128 * s_q32 as i128) >> 32;
+    fn scale_row(&self, acc: i64, s_q32: u64) -> i32 {
+        let p = acc as i128 * s_q32 as i128;
+        let scaled = match self.rounding {
+            Rounding::Default => p >> 32,
+            Rounding::Nearest => ((p >> 31) + 1) >> 1,
+        };
         if scaled > i32::MAX as i128 || scaled < i32::MIN as i128 {
             panic!("RowScaledTQ5: scaled output exceeds storage range");
         }
@@ -338,7 +356,7 @@ impl RowScaledTQ5 {
         (0..self.rows)
             .map(|r| {
                 let row = &self.data[r * self.cols..(r + 1) * self.cols];
-                Self::scale_row(Self::dot_any(row, x, split.as_ref()), self.scales_q32[r])
+                self.scale_row(Self::dot_any(row, x, split.as_ref()), self.scales_q32[r])
             })
             .collect()
     }
@@ -359,7 +377,7 @@ impl RowScaledTQ5 {
             .with_min_len(self.min_rows_per_task())
             .map(|r| {
                 let row = &self.data[r * self.cols..(r + 1) * self.cols];
-                Self::scale_row(Self::dot_any(row, x, split.as_ref()), self.scales_q32[r])
+                self.scale_row(Self::dot_any(row, x, split.as_ref()), self.scales_q32[r])
             })
             .collect()
     }
@@ -445,7 +463,7 @@ impl RowScaledTQ5 {
                     for (t, &k) in blk.iter().enumerate() {
                         let sp = splits[k].as_ref().unwrap();
                         for r in 0..TILE_R {
-                            let v = Self::scale_row(acc[r][t] + sp.hi_correction(rs[r]), self.scales_q32[r0 + r]);
+                            let v = self.scale_row(acc[r][t] + sp.hi_correction(rs[r]), self.scales_q32[r0 + r]);
                             unsafe { sink.write(k, r0 + r, v) };
                         }
                     }
@@ -454,7 +472,7 @@ impl RowScaledTQ5 {
             // rows past the last full group
             for r in groups * TILE_R..rows {
                 for &k in toks {
-                    let v = Self::scale_row(
+                    let v = self.scale_row(
                         Self::dot_any(row(r), batch[k], splits[k].as_ref()),
                         self.scales_q32[r],
                     );
@@ -467,7 +485,7 @@ impl RowScaledTQ5 {
         for tile in slow.chunks(TILE) {
             (0..rows).into_par_iter().for_each(|r| {
                 for &k in tile {
-                    let v = Self::scale_row(
+                    let v = self.scale_row(
                         Self::dot_any(row(r), batch[k], splits[k].as_ref()),
                         self.scales_q32[r],
                     );
@@ -477,10 +495,15 @@ impl RowScaledTQ5 {
         }
     }
 
-    /// `floor(acc * s / 2^(32 - FRAC_BITS))`; fails loud past the compute range.
+    /// `acc * s / 2^(32 - FRAC_BITS)` rounded by the matrix's mode; fails
+    /// loud past the compute range.
     #[inline(always)]
-    fn scale_row_q2f(acc: i64, s_q32: u64, q2f_shift: u32) -> i64 {
-        let wide = (acc as i128 * s_q32 as i128) >> q2f_shift;
+    fn scale_row_q2f(&self, acc: i64, s_q32: u64, q2f_shift: u32) -> i64 {
+        let p = acc as i128 * s_q32 as i128;
+        let wide = match self.rounding {
+            Rounding::Default => p >> q2f_shift,
+            Rounding::Nearest => ((p >> (q2f_shift - 1)) + 1) >> 1,
+        };
         if wide > i64::MAX as i128 || wide < i64::MIN as i128 {
             panic!("RowScaledTQ5: q2f scaled output exceeds compute range");
         }
@@ -498,7 +521,7 @@ impl RowScaledTQ5 {
         (0..self.rows)
             .map(|r| {
                 let row = &self.data[r * self.cols..(r + 1) * self.cols];
-                Self::scale_row_q2f(Self::dot_any(row, x, split.as_ref()), self.scales_q32[r], q2f_shift)
+                self.scale_row_q2f(Self::dot_any(row, x, split.as_ref()), self.scales_q32[r], q2f_shift)
             })
             .collect()
     }
@@ -519,9 +542,52 @@ impl RowScaledTQ5 {
             .with_min_len(self.min_rows_per_task())
             .map(|r| {
                 let row = &self.data[r * self.cols..(r + 1) * self.cols];
-                Self::scale_row_q2f(Self::dot_any(row, x, split.as_ref()), self.scales_q32[r], q2f_shift)
+                self.scale_row_q2f(Self::dot_any(row, x, split.as_ref()), self.scales_q32[r], q2f_shift)
             })
             .collect()
+    }
+
+    /// The exact row value `sum(code * x) * s / 2^32` for limbed wide activations.
+    fn wide_row(&self, r: usize, limbs: &[(u32, Vec<i32>)], splits: &[Option<SplitActivation>]) -> g_math::fixed_point::I512 {
+        use g_math::fixed_point::I512;
+        let row = &self.data[r * self.cols..(r + 1) * self.cols];
+        let mut total = I512::from(0i128);
+        for ((k, l), sp) in limbs.iter().zip(splits) {
+            total = total + (I512::from(Self::dot_any(row, l, sp.as_ref()) as i128) << (30 * *k as usize));
+        }
+        crate::exact::round_shift_i512(total * I512::from(self.scales_q32[r] as i128), -32, self.rounding)
+    }
+
+    fn matvec_wide_act_raw<W: g_math::fixed_point::Storage + Into<i128>>(&self, x: &[W], par: bool) -> Vec<W> {
+        assert_eq!(x.len(), self.cols, "RowScaledTQ5::matvec_wide_act: activation length mismatch");
+        let limbs = crate::exact::limbs30(x, <W as g_math::fixed_point::WideInt>::BITS);
+        let splits: Vec<Option<SplitActivation>> = limbs.iter().map(|(_, l)| SplitActivation::new(l)).collect();
+        let out = |r: usize| crate::exact::narrow_wide::<W>(self.wide_row(r, &limbs, &splits), "RowScaledTQ5");
+        if par && !self.serial_is_faster() {
+            (0..self.rows).into_par_iter().with_min_len(self.min_rows_per_task()).map(out).collect()
+        } else {
+            (0..self.rows).map(out).collect()
+        }
+    }
+
+    /// `matvec` for activations of a wider word (i64 or i128 storage, e.g.
+    /// Q32.32 or Q64.64, at any split): the exact value `sum(code * x) * s /
+    /// 2^32` rounded once at the activations' format by the matrix's rounding
+    /// mode. The activations run as exact 30-bit limbs through the 32-bit
+    /// kernels; a reference path, not a hot one.
+    pub fn matvec_wide_act<W: g_math::fixed_point::Storage + Into<i128>, const F: u32>(&self, x: &[Fixed<W, F>]) -> Vec<Fixed<W, F>>
+    where
+        Fixed<W, F>: FixedNum<Storage = W>,
+    {
+        self.matvec_wide_act_raw(Fixed::raw_slice(x), false).into_iter().map(Fixed::from_raw).collect()
+    }
+
+    /// [`Self::matvec_wide_act`] with the rows in parallel: the same results.
+    pub fn matvec_wide_act_par<W: g_math::fixed_point::Storage + Into<i128>, const F: u32>(&self, x: &[Fixed<W, F>]) -> Vec<Fixed<W, F>>
+    where
+        Fixed<W, F>: FixedNum<Storage = W>,
+    {
+        self.matvec_wide_act_raw(Fixed::raw_slice(x), true).into_iter().map(Fixed::from_raw).collect()
     }
 
     /// Serialize: `rows (u32) | cols (u32) | codes (i8 each) | scales (u64 each)`,

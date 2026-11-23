@@ -24,10 +24,15 @@
 //! two of each other); any other matrix takes the exact scalar path.
 
 use crate::bits::{decompose_e4m3, decompose_f32, ue8m0_exponent, E2M1_X2};
+use crate::exact::{FloorDiv, Rounding};
 use crate::tq5::{avx2_available, SplitActivation, MIN_TASK_BYTES, SERIAL_BELOW_BYTES};
 use g_math::fixed_point::imperative::OverflowDetected;
-use g_math::fixed_point::{Fixed, FixedNum, I512};
+use g_math::fixed_point::{Fixed, FixedNum, Storage, WideInt, I512};
 use rayon::prelude::*;
+
+/// Activation-half vectors up to which a batch decodes each row once in
+/// registers (no scratch): the speculative-checking sizes.
+const DIRECT_MAX_VECS: usize = 8;
 
 /// Rows per register tile and activations per full tile of the batched NVFP4 kernel.
 const TILE_R: usize = 3;
@@ -36,74 +41,6 @@ const TILE_T: usize = 4;
 // ---------------------------------------------------------------------------
 // exact finishing: floor(s * num * 2^shift / den), one rounding
 // ---------------------------------------------------------------------------
-
-/// Floor division of a signed 128-bit integer by a fixed positive divisor
-/// below 2^64 through a precomputed reciprocal (Moller-Granlund 2-by-1
-/// steps): exact, and no 128-bit hardware division per output.
-#[derive(Clone, Copy, Debug)]
-struct FloorDiv {
-    d: u64,
-    dn: u64,
-    v: u64,
-    shift: u32,
-}
-
-impl FloorDiv {
-    fn new(d: u64) -> Self {
-        assert!(d > 0, "FloorDiv: zero divisor");
-        let shift = d.leading_zeros();
-        let dn = d << shift;
-        // floor((2^128 - 1) / dn) - 2^64: the quotient lies in [2^64, 2^65)
-        let v = (u128::MAX / dn as u128) as u64;
-        Self { d, dn, v, shift }
-    }
-
-    /// `(q, r)` of `(u1 * 2^64 + u0) / dn` for `u1 < dn`.
-    #[inline(always)]
-    fn div_2by1(&self, u1: u64, u0: u64) -> (u64, u64) {
-        let p = (self.v as u128) * (u1 as u128);
-        let p = p.wrapping_add(((u1 as u128) << 64) | u0 as u128);
-        let mut q1 = ((p >> 64) as u64).wrapping_add(1);
-        let q0 = p as u64;
-        let mut r = u0.wrapping_sub(q1.wrapping_mul(self.dn));
-        if r > q0 {
-            q1 = q1.wrapping_sub(1);
-            r = r.wrapping_add(self.dn);
-        }
-        if r >= self.dn {
-            q1 = q1.wrapping_add(1);
-            r -= self.dn;
-        }
-        (q1, r)
-    }
-
-    /// `(n / d, n % d)` for an unsigned 128-bit `n`.
-    #[inline(always)]
-    fn divmod_u128(&self, n: u128) -> (u128, u64) {
-        let s = self.shift;
-        // n << s spans three words; the top one is below 2^s <= dn
-        let u2 = if s == 0 { 0 } else { (n >> (128 - s)) as u64 };
-        let m = n << s;
-        let (q1, r) = self.div_2by1(u2, (m >> 64) as u64);
-        let (q0, r) = self.div_2by1(r, m as u64);
-        (((q1 as u128) << 64) | q0 as u128, r >> s)
-    }
-
-    /// `floor(n / d)`.
-    #[inline(always)]
-    fn floor(&self, n: i128) -> i128 {
-        if self.d == 1 {
-            return n;
-        }
-        let (q, r) = self.divmod_u128(n.unsigned_abs());
-        // d >= 2, so q <= 2^126 and the casts are exact
-        if n >= 0 {
-            q as i128
-        } else {
-            -(q as i128) - (r != 0) as i128
-        }
-    }
-}
 
 /// The matrix's factor applied to one exact row sum `s`:
 /// `floor(s * num * 2^(shift + extra) / den)`. `None` when the result does not
@@ -144,6 +81,25 @@ fn strip(m: u64, e: i32) -> (u64, i32) {
         let t = m.trailing_zeros();
         (m >> t, e + t as i32)
     }
+}
+
+/// An output under a rounding mode from a floor-rounding finish `f(extra)`:
+/// `Nearest` is `floor(2x)` one bit finer, then `(+1) >> 1`
+/// (`floor(x + 1/2)`, ties toward +infinity).
+#[inline(always)]
+fn rounded(r: Rounding, extra: i32, f: impl Fn(i32) -> Option<i128>) -> Option<i128> {
+    match r {
+        Rounding::Default => f(extra),
+        Rounding::Nearest => f(extra + 1).and_then(|v| v.checked_add(1)).map(|v| v >> 1),
+    }
+}
+
+/// An exact row sum: native when it fits, 512 bits otherwise (MXFP8 with
+/// block scales far apart).
+#[derive(Clone, Copy)]
+enum RowSum {
+    N(i128),
+    W(I512),
 }
 
 #[inline]
@@ -206,6 +162,7 @@ pub struct NvFp4Matrix {
     /// Block pairs a 32-bit SIMD lane accumulates before it is widened.
     pairs_per_flush: usize,
     finish: Finish,
+    rounding: Rounding,
 }
 
 impl NvFp4Matrix {
@@ -293,7 +250,7 @@ impl NvFp4Matrix {
                 packed[r * pairs * 16 + (b / 2) * 16 + c % 16] |= code << (4 * (b % 2));
             }
         }
-        Ok(Self { rows, cols, nb, pairs, packed, scales, amax_bits, den_bits, mult, mult32, pairs_per_flush, finish })
+        Ok(Self { rows, cols, nb, pairs, packed, scales, amax_bits, den_bits, mult, mult32, pairs_per_flush, finish, rounding: Rounding::Default })
     }
 
     pub fn rows(&self) -> usize {
@@ -303,6 +260,15 @@ impl NvFp4Matrix {
         self.cols
     }
     /// The codes in the checkpoint layout (`rows * cols / 2` bytes, low nibble = even column).
+    /// The same matrix rounding its outputs by `rounding` (see [`Rounding`]).
+    pub fn with_rounding(mut self, rounding: Rounding) -> Self {
+        self.rounding = rounding;
+        self
+    }
+    /// The rounding mode applied to every output.
+    pub fn rounding(&self) -> Rounding {
+        self.rounding
+    }
     pub fn to_codes(&self) -> Vec<u8> {
         let mut codes = vec![0u8; self.rows * self.cols / 2];
         for r in 0..self.rows {
@@ -531,6 +497,7 @@ pub struct MxFp8Matrix {
     /// weight `ELEM * 2^d = wh * 2^B + wl` in two 16-bit limbs, as
     /// `(B, tile steps per 32-bit lane widening)`
     limbs: Option<(u32, usize)>,
+    rounding: Rounding,
 }
 
 impl MxFp8Matrix {
@@ -563,7 +530,7 @@ impl MxFp8Matrix {
             smax = 0;
         }
         let spread = smax - smin;
-        Ok(Self { rows, cols, elems, scales, smin, spread, simd: MxSimd::for_spread(spread), limbs: mx_limbs(spread) })
+        Ok(Self { rows, cols, elems, scales, smin, spread, simd: MxSimd::for_spread(spread), limbs: mx_limbs(spread), rounding: Rounding::Default })
     }
 
     pub fn rows(&self) -> usize {
@@ -571,6 +538,15 @@ impl MxFp8Matrix {
     }
     pub fn cols(&self) -> usize {
         self.cols
+    }
+    /// The same matrix rounding its outputs by `rounding` (see [`Rounding`]).
+    pub fn with_rounding(mut self, rounding: Rounding) -> Self {
+        self.rounding = rounding;
+        self
+    }
+    /// The rounding mode applied to every output.
+    pub fn rounding(&self) -> Rounding {
+        self.rounding
     }
     /// The E4M3 elements as given.
     pub fn elems(&self) -> &[u8] {
@@ -957,6 +933,24 @@ trait BlockRows: Sync {
     fn row_out(&self, r: usize, x: &[i32], split: Option<&SplitActivation>, extra: i32) -> Option<i128>;
     /// The output from an exact row sum.
     fn finish_sum(&self, s: i128, extra: i32) -> Option<i128>;
+    /// The exact row sum at 512 bits (the wide-activation path).
+    fn row_sum_wide(&self, r: usize, x: &[i32], split: Option<&SplitActivation>) -> I512;
+    /// A wide exact sum to the output scale under the matrix's rounding.
+    fn finish_wide(&self, total: I512) -> I512;
+    /// Whether [`BlockRows::row_vecs`] may run (AVX2, SIMD-eligible matrix).
+    fn direct_ready(&self) -> bool {
+        false
+    }
+    /// Exact sums of row `r` against 1 to `DIRECT_MAX_VECS` vectors of 16-bit
+    /// activation halves, each block decoded once in registers (no scratch).
+    ///
+    /// # Safety
+    /// Only when [`BlockRows::direct_ready`] holds; vectors have `cols` elements.
+    unsafe fn row_vecs(&self, _r: usize, _vecs: &[&[i16]]) -> [i128; DIRECT_MAX_VECS] {
+        unreachable!()
+    }
+    /// The exact contribution of the listed high halves to row `r`, `<< 16`.
+    fn hi_corr(&self, r: usize, xs: &SplitActivation) -> i128;
     /// Whether the batched tile may run (AVX2, SIMD-eligible matrix).
     fn batch_ready(&self) -> bool {
         false
@@ -996,27 +990,62 @@ impl BlockRows for NvFp4Matrix {
     }
     #[inline]
     fn row_out(&self, r: usize, x: &[i32], split: Option<&SplitActivation>, extra: i32) -> Option<i128> {
-        #[cfg(target_arch = "x86_64")]
-        if let (Some(xs), Some(m32)) = (split, self.mult32.as_deref()) {
-            if avx2_available() {
-                let (pk, sc) = self.row_ptrs(r);
-                // SAFETY: AVX2 checked; the row has nb blocks, the halves cols elements
-                let s = unsafe {
-                    if sparse(xs, self.cols, Self::SPARSE_DIV) {
-                        let [[lo]] = nvfp4_tile::<1, 1>([pk], [sc], self.nb, m32.as_ptr(), [xs.lo.as_ptr()], self.pairs_per_flush);
-                        lo as i128 + self.hi_correction(r, xs)
-                    } else {
-                        let [[lo, hi]] = nvfp4_tile::<1, 2>([pk], [sc], self.nb, m32.as_ptr(), [xs.lo.as_ptr(), xs.hi.as_ptr()], self.pairs_per_flush);
-                        lo as i128 + ((hi as i128) << 16)
-                    }
-                };
-                return self.finish.apply(s, extra);
-            }
-        }
-        self.finish.apply(self.sum_scalar(r, x), extra)
+        let s = self.nv_row_sum(r, x, split);
+        rounded(self.rounding, extra, |e| self.finish.apply(s, e))
+    }
+    fn row_sum_wide(&self, r: usize, x: &[i32], split: Option<&SplitActivation>) -> I512 {
+        I512::from(self.nv_row_sum(r, x, split))
+    }
+    fn finish_wide(&self, total: I512) -> I512 {
+        // floor / nearest of total * num * 2^shift / den
+        let n = total * I512::from(self.finish.num);
+        let (n, d) = if self.finish.shift >= 0 {
+            (n << self.finish.shift as usize, I512::from(self.finish.div.d as i128))
+        } else {
+            (n, I512::from(self.finish.div.d as i128) << (-self.finish.shift) as usize)
+        };
+        crate::exact::round_div_i512(n, d, self.rounding)
     }
     fn finish_sum(&self, s: i128, extra: i32) -> Option<i128> {
-        self.finish.apply(s, extra)
+        rounded(self.rounding, extra, |e| self.finish.apply(s, e))
+    }
+    fn direct_ready(&self) -> bool {
+        self.batch_ready()
+    }
+    unsafe fn row_vecs(&self, r: usize, vecs: &[&[i16]]) -> [i128; DIRECT_MAX_VECS] {
+        let mut out = [0i128; DIRECT_MAX_VECS];
+        #[cfg(target_arch = "x86_64")]
+        {
+            // one weight vector + T accumulators + one activation: T <= 8 fits the 16 registers
+            assert!(r < self.rows && (1..=DIRECT_MAX_VECS).contains(&vecs.len()) && vecs.iter().all(|v| v.len() >= self.cols));
+            let m32 = self.mult32.as_deref().unwrap().as_ptr();
+            let (pk, sc) = self.row_ptrs(r);
+            macro_rules! go {
+                ($t:literal) => {{
+                    let vs: [*const i16; $t] = std::array::from_fn(|k| vecs[k].as_ptr());
+                    let [a] = nvfp4_tile::<1, $t>([pk], [sc], self.nb, m32, vs, self.pairs_per_flush);
+                    for k in 0..$t {
+                        out[k] = a[k] as i128;
+                    }
+                }};
+            }
+            match vecs.len() {
+                8 => go!(8),
+                7 => go!(7),
+                6 => go!(6),
+                5 => go!(5),
+                4 => go!(4),
+                3 => go!(3),
+                2 => go!(2),
+                _ => go!(1),
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (r, vecs);
+        out
+    }
+    fn hi_corr(&self, r: usize, xs: &SplitActivation) -> i128 {
+        self.hi_correction(r, xs)
     }
     fn batch_ready(&self) -> bool {
         cfg!(target_arch = "x86_64") && self.mult32.is_some() && avx2_available()
@@ -1034,6 +1063,29 @@ impl BlockRows for NvFp4Matrix {
 }
 
 impl NvFp4Matrix {
+    /// The exact row sum `sum E2M1_X2 * mult * x` (before the factor).
+    #[inline]
+    fn nv_row_sum(&self, r: usize, x: &[i32], split: Option<&SplitActivation>) -> i128 {
+        #[cfg(target_arch = "x86_64")]
+        if let (Some(xs), Some(m32)) = (split, self.mult32.as_deref()) {
+            if avx2_available() {
+                let (pk, sc) = self.row_ptrs(r);
+                // SAFETY: AVX2 checked; the row has nb blocks, the halves cols elements
+                let s = unsafe {
+                    if sparse(xs, self.cols, Self::SPARSE_DIV) {
+                        let [[lo]] = nvfp4_tile::<1, 1>([pk], [sc], self.nb, m32.as_ptr(), [xs.lo.as_ptr()], self.pairs_per_flush);
+                        lo as i128 + self.hi_correction(r, xs)
+                    } else {
+                        let [[lo, hi]] = nvfp4_tile::<1, 2>([pk], [sc], self.nb, m32.as_ptr(), [xs.lo.as_ptr(), xs.hi.as_ptr()], self.pairs_per_flush);
+                        lo as i128 + ((hi as i128) << 16)
+                    }
+                };
+                return s;
+            }
+        }
+        self.sum_scalar(r, x)
+    }
+
     fn hi_correction(&self, r: usize, xs: &SplitActivation) -> i128 {
         let mut s = 0i64;
         for &(i, h) in &xs.hi_nz {
@@ -1058,6 +1110,52 @@ impl BlockRows for MxFp8Matrix {
     }
     #[inline]
     fn row_out(&self, r: usize, x: &[i32], split: Option<&SplitActivation>, extra: i32) -> Option<i128> {
+        match self.mx_row_sum(r, x, split) {
+            RowSum::N(s) => rounded(self.rounding, extra, |e| self.finish(s, e)),
+            RowSum::W(s) => rounded(self.rounding, extra, |e| self.finish_i512(s, e)),
+        }
+    }
+    fn row_sum_wide(&self, r: usize, x: &[i32], split: Option<&SplitActivation>) -> I512 {
+        match self.mx_row_sum(r, x, split) {
+            RowSum::N(s) => I512::from(s),
+            RowSum::W(s) => s,
+        }
+    }
+    fn finish_wide(&self, total: I512) -> I512 {
+        crate::exact::round_shift_i512(total, self.smin - 136, self.rounding)
+    }
+    fn finish_sum(&self, s: i128, extra: i32) -> Option<i128> {
+        rounded(self.rounding, extra, |e| self.finish(s, e))
+    }
+    // no direct path: the class kernel's cost grows with classes x vectors;
+    // the two-limb scratch tile is faster from two activations (measured)
+    fn hi_corr(&self, r: usize, xs: &SplitActivation) -> i128 {
+        self.hi_correction(r, xs)
+    }
+    fn batch_ready(&self) -> bool {
+        cfg!(target_arch = "x86_64") && self.limbs.is_some() && avx2_available()
+    }
+    fn batch_rows(&self) -> usize {
+        2
+    }
+    fn batch_shift(&self, c: usize) -> u32 {
+        c as u32 * self.limbs.map_or(0, |(b, _)| b)
+    }
+    fn tile_period(&self) -> usize {
+        self.limbs.map_or(1, |(_, p)| p)
+    }
+    unsafe fn decode_row(&self, r: usize, out: &mut [i16]) {
+        #[cfg(target_arch = "x86_64")]
+        mxfp8_decode_limbs(self, self.limbs.unwrap().0, r, out);
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (r, out);
+    }
+}
+
+impl MxFp8Matrix {
+    /// The exact row sum `sum ELEM * 2^d * x` (before `2^(s_min - 136)`).
+    #[inline]
+    fn mx_row_sum(&self, r: usize, x: &[i32], split: Option<&SplitActivation>) -> RowSum {
         #[cfg(target_arch = "x86_64")]
         if let (Some(xs), Some(sd)) = (split, self.simd.as_ref()) {
             if avx2_available() {
@@ -1084,39 +1182,16 @@ impl BlockRows for MxFp8Matrix {
                         _ => run!(15),
                     }
                 };
-                return self.finish(s, extra);
+                return RowSum::N(s);
             }
         }
         if self.spread <= MX_I128_SPREAD {
-            self.finish(self.sum_scalar_i128(r, x), extra)
+            RowSum::N(self.sum_scalar_i128(r, x))
         } else {
-            self.finish_i512(self.sum_scalar_i512(r, x), extra)
+            RowSum::W(self.sum_scalar_i512(r, x))
         }
     }
-    fn finish_sum(&self, s: i128, extra: i32) -> Option<i128> {
-        self.finish(s, extra)
-    }
-    fn batch_ready(&self) -> bool {
-        cfg!(target_arch = "x86_64") && self.limbs.is_some() && avx2_available()
-    }
-    fn batch_rows(&self) -> usize {
-        2
-    }
-    fn batch_shift(&self, c: usize) -> u32 {
-        c as u32 * self.limbs.map_or(0, |(b, _)| b)
-    }
-    fn tile_period(&self) -> usize {
-        self.limbs.map_or(1, |(_, p)| p)
-    }
-    unsafe fn decode_row(&self, r: usize, out: &mut [i16]) {
-        #[cfg(target_arch = "x86_64")]
-        mxfp8_decode_limbs(self, self.limbs.unwrap().0, r, out);
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = (r, out);
-    }
-}
 
-impl MxFp8Matrix {
     fn hi_correction(&self, r: usize, xs: &SplitActivation) -> i128 {
         let (elems, scales) = self.row(r);
         let mut s = 0i128;
@@ -1204,6 +1279,40 @@ fn matvec_batch_par_into_raw<M: BlockRows>(m: &M, batch: &[&[i32]], out: &mut [i
     let what = M::NAME;
     let sink = crate::ops::BatchOut::new(out, rows, batch.len(), "matvec_batch_par_into");
     let splits: Vec<Option<SplitActivation>> = batch.iter().map(|x| SplitActivation::new(x)).collect();
+    // A few activations (speculative checks, drafting): decode each row once
+    // in registers for all of them, no scratch; the same exact sums.
+    let direct: Vec<usize> = (0..batch.len()).filter(|&k| splits[k].is_some()).collect();
+    let direct_vecs: usize = direct.iter().map(|&k| 1 + !sparse(splits[k].as_ref().unwrap(), cols, M::SPARSE_DIV) as usize).sum();
+    if m.direct_ready() && rows > 0 && direct_vecs <= DIRECT_MAX_VECS && direct_vecs > 0 {
+        let mut vecs: Vec<&[i16]> = Vec::with_capacity(direct_vecs);
+        let mut slot: Vec<(usize, usize, Option<usize>)> = Vec::new(); // (token, lo, hi)
+        for &k in &direct {
+            let xs = splits[k].as_ref().unwrap();
+            let lo = vecs.len();
+            vecs.push(&xs.lo);
+            let hi = (!sparse(xs, cols, M::SPARSE_DIV)).then(|| {
+                vecs.push(&xs.hi);
+                vecs.len() - 1
+            });
+            slot.push((k, lo, hi));
+        }
+        (0..rows).into_par_iter().with_min_len(min_rows_per_task(m)).for_each(|r| {
+            // SAFETY: direct_ready; every vector has cols elements
+            let sums = unsafe { m.row_vecs(r, &vecs) };
+            for &(k, lo, hi) in &slot {
+                let s = sums[lo] + hi.map_or_else(|| m.hi_corr(r, splits[k].as_ref().unwrap()), |h| sums[h] << 16);
+                // SAFETY: each row belongs to one task
+                unsafe { sink.write(k, r, narrow_i32(m.finish_sum(s, 0), what)) };
+            }
+        });
+        for &k in (0..batch.len()).filter(|&k| splits[k].is_none()).collect::<Vec<_>>().iter() {
+            (0..rows).into_par_iter().with_min_len(min_rows_per_task(m)).for_each(|r| {
+                // SAFETY: each row belongs to one task
+                unsafe { sink.write(k, r, narrow_i32(m.row_out(r, batch[k], None, 0), what)) };
+            });
+        }
+        return;
+    }
     let tiled = m.batch_ready() && rows > 0;
     // vectors through the tile; for each, the activation whose sparse high halves it must correct
     let mut vecs: Vec<&[i16]> = Vec::new();
@@ -1316,6 +1425,27 @@ fn matvec_batch_par_into_raw<M: BlockRows>(m: &M, batch: &[&[i32]], out: &mut [i
     }
 }
 
+/// Activations of a wider word (Q32.32, Q64.64): each balanced 30-bit limb
+/// of the activations through the exact 32-bit row sums, the limb sums
+/// combined at 512 bits, one rounding at the activations' format.
+fn matvec_wide_act_raw<M: BlockRows, W: Storage + Into<i128>>(m: &M, x: &[W], par: bool) -> Vec<W> {
+    assert_eq!(x.len(), m.n_cols(), "{}::matvec_wide_act: activation length mismatch", M::NAME);
+    let limbs = crate::exact::limbs30(x, <W as WideInt>::BITS);
+    let splits: Vec<Option<SplitActivation>> = limbs.iter().map(|(_, l)| SplitActivation::new(l)).collect();
+    let row = |r: usize| -> W {
+        let mut total = I512::from(0i128);
+        for ((k, l), sp) in limbs.iter().zip(&splits) {
+            total = total + (m.row_sum_wide(r, l, sp.as_ref()) << (30 * *k as usize));
+        }
+        crate::exact::narrow_wide::<W>(m.finish_wide(total), M::NAME)
+    };
+    if par && !serial_is_faster(m) {
+        (0..m.n_rows()).into_par_iter().with_min_len(min_rows_per_task(m)).map(row).collect()
+    } else {
+        (0..m.n_rows()).map(row).collect()
+    }
+}
+
 macro_rules! public_forms {
     ($t:ty) => {
         impl $t {
@@ -1364,6 +1494,25 @@ macro_rules! public_forms {
                 Fixed<i32, F>: FixedNum<Storage = i32>,
             {
                 matvec_q2f_raw(self, Fixed::raw_slice(x), F)
+            }
+            /// `matvec` for activations of a wider word (i64 or i128 storage,
+            /// e.g. Q32.32 or Q64.64, at any split): the exact value
+            /// `sum_c value(r, c) * x[c]` rounded once at the activations'
+            /// format by the matrix's rounding mode. The activations run as
+            /// exact 30-bit limbs through the 32-bit kernels; a reference
+            /// path (a few times a 32-bit matvec), not a hot one.
+            pub fn matvec_wide_act<W: Storage + Into<i128>, const F: u32>(&self, x: &[Fixed<W, F>]) -> Vec<Fixed<W, F>>
+            where
+                Fixed<W, F>: FixedNum<Storage = W>,
+            {
+                matvec_wide_act_raw(self, Fixed::raw_slice(x), false).into_iter().map(Fixed::from_raw).collect()
+            }
+            /// [`Self::matvec_wide_act`] with the rows in parallel: the same results.
+            pub fn matvec_wide_act_par<W: Storage + Into<i128>, const F: u32>(&self, x: &[Fixed<W, F>]) -> Vec<Fixed<W, F>>
+            where
+                Fixed<W, F>: FixedNum<Storage = W>,
+            {
+                matvec_wide_act_raw(self, Fixed::raw_slice(x), true).into_iter().map(Fixed::from_raw).collect()
             }
             /// [`Self::matvec_q2f`] with the rows in parallel: the same results.
             pub fn matvec_q2f_par<const F: u32>(&self, x: &[Fixed<i32, F>]) -> Vec<i64>

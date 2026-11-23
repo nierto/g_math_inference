@@ -75,6 +75,13 @@ assert_eq!(planar.matvec(&acts), dense);
   fraction per matrix); row sums are exact and each output is rounded once,
   `floor`, as `RowScaledTQ5` rounds. The same forms as `RowScaledTQ5`
   (`matvec`, `_par`, `_batch_par(_into)`, `matvec_q2f(_par)`).
+- **`Rounding`** (0.1.5): every scaled and TQ1.9 form rounds by its
+  released rule (`Default`) or rounds the exact value once to nearest
+  (`Nearest`, `with_rounding`). **`matvec_wide_act`** runs the block-scaled
+  forms and `RowScaledTQ5` at Q32.32 / Q64.64 activations, and
+  **`quantize_nvfp4` / `quantize_mxfp8`** with `matvec_quantized` evaluate
+  the checkpoints' activation quantisation exactly: reference paths for
+  measuring where precision matters.
 - **`bits`** and **`quantize`** (0.6.5): binary16 / bfloat16 bit
   patterns (and E2M1, E4M3, UE8M0, binary32 as integer and exponent)
   decoded to fixed point by integer shifts, and the quantisers from

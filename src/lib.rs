@@ -72,7 +72,9 @@ macro_rules! on_words {
 }
 
 pub mod bits;
+pub mod actquant;
 pub mod blockscaled;
+mod exact;
 mod hybrid;
 mod ops;
 mod planar;
@@ -89,6 +91,8 @@ pub use ops::{TqWord, WideOutput};
 pub use rowscaled::RowScaledTQ19;
 pub use tq5::{RowScaledTQ5, TQ5_MAX};
 pub use blockscaled::{MxFp8Matrix, NvFp4Matrix};
+pub use exact::Rounding;
+pub use actquant::{quantize_mxfp8, quantize_nvfp4, Mxfp8Activation, Nvfp4Activation};
 
 use g_math::fixed_point::{Compute, Fixed, FixedNum};
 
@@ -158,6 +162,7 @@ pub struct TQ19Matrix {
     rows: usize,
     cols: usize,
     data: Vec<i16>,
+    rounding: Rounding,
 }
 
 impl TQ19Matrix {
@@ -167,7 +172,7 @@ impl TQ19Matrix {
     /// Panics if `data.len() != rows * cols`.
     pub fn new(rows: usize, cols: usize, data: Vec<i16>) -> Self {
         assert_eq!(data.len(), rows * cols, "TQ19Matrix: data.len() must equal rows × cols");
-        Self { rows, cols, data }
+        Self { rows, cols, data, rounding: Rounding::Default }
     }
 
     /// Create from a generator function `f(row, col) -> i16`.
@@ -178,10 +183,19 @@ impl TQ19Matrix {
                 data.push(f(r, c));
             }
         }
-        Self { rows, cols, data }
+        Self { rows, cols, data, rounding: Rounding::Default }
     }
 
     /// Number of rows.
+    /// The same matrix rounding its outputs by `rounding` (see [`Rounding`]).
+    pub fn with_rounding(mut self, rounding: Rounding) -> Self {
+        self.rounding = rounding;
+        self
+    }
+
+    /// The rounding mode applied to every output.
+    pub fn rounding(&self) -> Rounding { self.rounding }
+
     #[inline]
     pub fn rows(&self) -> usize { self.rows }
 
@@ -221,7 +235,7 @@ impl TQ19Matrix {
         Fixed<S, F>: FixedNum<Storage = S>,
         {
         assert_eq!(activations.len(), self.cols, "TQ19Matrix::matvec: activation length mismatch");
-        ops::tq19_matvec(&self.data, self.rows, self.cols, activations)
+        ops::tq19_matvec(&self.data, self.rows, self.cols, activations, self.rounding)
     }
 
     /// Batch matrix-vector: same weights applied to multiple activation vectors.
@@ -238,7 +252,7 @@ impl TQ19Matrix {
         for (i, v) in batch.iter().enumerate() {
             assert_eq!(v.len(), self.cols, "TQ19Matrix::matvec_batch: activation[{i}] length mismatch");
         }
-        ops::tq19_matvec_batch(&self.data, self.rows, self.cols, batch)
+        ops::tq19_matvec_batch(&self.data, self.rows, self.cols, batch, self.rounding)
     }
 
     /// Convenience: matvec returning `FixedPoint` values.
@@ -259,7 +273,7 @@ impl TQ19Matrix {
         Fixed<S, F>: FixedNum<Storage = S>,
         {
         assert_eq!(activations.len(), self.cols, "TQ19Matrix::matvec_par: activation length mismatch");
-        ops::tq19_matvec_par(&self.data, self.rows, self.cols, activations)
+        ops::tq19_matvec_par(&self.data, self.rows, self.cols, activations, self.rounding)
     }
 
     /// Row-parallel batch matvec.
@@ -273,7 +287,7 @@ impl TQ19Matrix {
         for (i, v) in batch.iter().enumerate() {
             assert_eq!(v.len(), self.cols, "TQ19Matrix::matvec_batch_par: activation[{i}] length mismatch");
         }
-        ops::tq19_matvec_batch_par(&self.data, self.rows, self.cols, batch)
+        ops::tq19_matvec_batch_par(&self.data, self.rows, self.cols, batch, self.rounding)
     }
 
     /// [`matvec_batch_par`](Self::matvec_batch_par) writing into a
@@ -291,7 +305,7 @@ impl TQ19Matrix {
         for (i, v) in batch.iter().enumerate() {
             assert_eq!(v.len(), self.cols, "TQ19Matrix::matvec_batch_par_into: activation[{i}] length mismatch");
         }
-        ops::tq19_matvec_batch_par_into(&self.data, self.rows, self.cols, batch, out)
+        ops::tq19_matvec_batch_par_into(&self.data, self.rows, self.cols, batch, out, self.rounding)
     }
 
     // ========================================================================
@@ -311,7 +325,7 @@ impl TQ19Matrix {
         Fixed<S, F>: FixedNum<Storage = S>,
         {
         assert_eq!(activations.len(), self.cols, "TQ19Matrix::matvec_q2f: activation length mismatch");
-        ops::tq19_matvec_q2f(&self.data, self.rows, self.cols, activations)
+        ops::tq19_matvec_q2f(&self.data, self.rows, self.cols, activations, self.rounding)
     }
 
     /// Row-parallel wide-output matvec. See [`TQ19Matrix::matvec_q2f`].
@@ -320,7 +334,7 @@ impl TQ19Matrix {
         Fixed<S, F>: FixedNum<Storage = S>,
         {
         assert_eq!(activations.len(), self.cols, "TQ19Matrix::matvec_q2f_par: activation length mismatch");
-        ops::tq19_matvec_q2f_par(&self.data, self.rows, self.cols, activations)
+        ops::tq19_matvec_q2f_par(&self.data, self.rows, self.cols, activations, self.rounding)
     }
 
     /// Row-parallel wide-output batch matvec. See [`TQ19Matrix::matvec_q2f`].
@@ -331,7 +345,7 @@ impl TQ19Matrix {
         for (i, v) in batch.iter().enumerate() {
             assert_eq!(v.len(), self.cols, "TQ19Matrix::matvec_q2f_batch_par: activation[{i}] length mismatch");
         }
-        ops::tq19_matvec_q2f_batch_par(&self.data, self.rows, self.cols, batch)
+        ops::tq19_matvec_q2f_batch_par(&self.data, self.rows, self.cols, batch, self.rounding)
     }
 }
 
