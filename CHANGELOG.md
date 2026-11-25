@@ -3,6 +3,71 @@
 All notable changes to g_math_inference are documented in this file. Each
 release names the g_math version it was verified against.
 
+## [0.1.6] - 2026-11-26
+
+Additive: every released result is unchanged. Verified against g_math 0.7.6
+(the Walsh-Hadamard transform of `Ptq1Matrix` is g_math's
+`walsh_hadamard_blocks_in_place`).
+
+### Added
+
+- **`Ptq1Matrix`**: ternary weights in the PTQ1_0 GGUF block layout (128
+  weights in 28 bytes: base-3 trits packed five and four per byte, one
+  binary16 scale per block), computed on exactly at 1.75 bits per weight.
+  Every byte decodes by the integer formula of the format (`((q * 3^n mod
+  256) * 3) >> 8`), every finite binary16 scale is an exact integer times
+  `2^-24`. `with_hadamard(block, signs)` applies the checkpoints' input
+  rotation `H D x / sqrt(block)` (block a power of four up to 4096) on the
+  exact integers, the `1 / sqrt(block)` folded into the one rounding. The
+  forms of the other scaled matrices: `matvec`, `_par`, `matvec_q2f(_par)`,
+  `matvec_batch_par(_into)`, `matvec_q2f_batch_par(_into)`, `with_rounding`,
+  `dequant_row_exact`. Kernels: each row's block scales are folded into
+  16-bit weights (blocks within four binades of the row's largest scale;
+  smaller ones added per block, exactly), a row panel is decoded once and
+  run against four activations at a time by 16-bit multiply-adds over exact
+  activation limbs (width chosen per call from the activations' range).
+- **`RowScaledTQ19`**: `matvec_batch_par`, `_into` and
+  `matvec_q2f_batch_par` load each 16-column weight chunk once for four
+  activations and multiply 16-bit pairs (the activations as exact 11-bit
+  limbs, the lanes moved to 64 bits before they can overflow): 2304 x 3072
+  at 8 activations in 0.37-0.53x the time (two runs; the old path varies
+  more than the new), the 200058-row head at 8 in 0.31-0.47x;
+  `matvec_rows(rows, x)` and `matvec_rows_q2f`: the outputs of a subset of
+  rows, equal to those rows of `matvec`.
+- **`I16Matrix`**: a dense i16 matrix with an exact `matvec_i64(_par)`
+  (`sum F[r][j] * t[j]` in i64 for every i16 input: 32-bit lanes moved to 64
+  bits on a period derived from the largest entries; a pair of -32768
+  products takes the exact scalar path). 200058 x 256 in 3.6 ms on 4 cores.
+- **`NvFp4Matrix` / `MxFp8Matrix::matvec_q2f_batch_par(_into)`**: the
+  batched wide output, by the same decode-once kernels as
+  `matvec_batch_par`.
+- **`bits::f32_to_raw`, `f32_to_storage_raw`, `f32_to_fixed`**: binary32
+  patterns at a fixed-point format, truncated toward zero like the 16-bit
+  decoders (`decompose_f32` is the exact value).
+
+### Validation
+
+- `tests/ptq1_validation.rs`: exact-fraction references (decode, binary16,
+  the transform with and without signs), each value confirmed by mpmath at
+  200 digits with a real square root; a 2304 x 2048 random differential
+  against an independent integer reference, batches 1..9 and 64, 1/2/3/8
+  threads; worst-case lanes (folded weights 2047 * 2^4, every limb at its
+  largest) and outlier blocks; construction errors. Unit tests: the decode
+  equal to the format's reference loop for every byte at every position,
+  the canonical encoding round trip, all finite binary16 patterns.
+- `tests/rowscaled_batch_validation.rs`: mpmath references for every
+  batched and row-subset form at both roundings (Q22.10, Q16.16, column
+  tails); batched equal to single at batches 1..9, 16, 64 and 1/2/3/8
+  threads; worst-case lanes at every limb count.
+- `tests/i16_gemv_validation.rs`: references (integers, confirmed by
+  mpmath) in every lane regime, including a pair whose products sum to 2^31.
+- `tests/f32_decoder_validation.rs`: 153 binary32 patterns against mpmath
+  at six formats.
+- `tests/blockscaled_validation.rs`: the batched wide forms against the
+  references; the reference generator now confirms every output by mpmath.
+- Planted kernel changes (decode, fold, limb widths, flush periods, outlier
+  blocks, the pair fallback) each fail a gate.
+
 ## [0.1.5] - 2026-11-24
 
 Every released result is unchanged unless a matrix is switched to

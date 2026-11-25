@@ -164,6 +164,82 @@ pub(crate) unsafe fn trit_dot_avx2(
 
 
 // ============================================================================
+// TQ1.9 rows x a few activations by 16-bit multiply-adds over 11-bit limbs
+// ============================================================================
+
+/// Bits per activation limb of the TQ1.9 batched path.
+pub(crate) const LIMB_BITS: u32 = 11;
+
+/// The per-limb sums `sum_i w[i] * limb_{t,l}[i]` for `T` activations of `L`
+/// limbs each, over `16 * steps` columns of 16-bit weights `w` (limbs of `lb`
+/// bits: `x = sum_l limb_l * 2^(lb l)`, the lower limbs unsigned, the top one
+/// signed, every limb within +-2^lb). A 32-bit lane gains at most
+/// `2 * max|w| * 2^lb` per step and moves to 64 bits every `period` steps,
+/// which the caller chose so the lane cannot overflow.
+///
+/// # Safety
+/// AVX2 available; `w` and every limb slice hold `16 * steps` elements.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn limb_tile<const T: usize, const L: usize>(w: *const i16, x: [[*const i16; L]; T], steps: usize, period: usize) -> [[i64; L]; T] {
+    let mut acc = [[_mm256_setzero_si256(); L]; T];
+    let mut wide = [[_mm256_setzero_si256(); L]; T];
+    let mut since = 0usize;
+    for s in 0..steps {
+        let wv = _mm256_loadu_si256(w.add(16 * s) as *const __m256i);
+        for t in 0..T {
+            for l in 0..L {
+                let xv = _mm256_loadu_si256(x[t][l].add(16 * s) as *const __m256i);
+                acc[t][l] = _mm256_add_epi32(acc[t][l], _mm256_madd_epi16(wv, xv));
+            }
+        }
+        since += 1;
+        if since == period {
+            for t in 0..T {
+                for l in 0..L {
+                    wide[t][l] = _mm256_add_epi64(wide[t][l], _mm256_cvtepi32_epi64(_mm256_castsi256_si128(acc[t][l])));
+                    wide[t][l] = _mm256_add_epi64(wide[t][l], _mm256_cvtepi32_epi64(_mm256_extracti128_si256(acc[t][l], 1)));
+                    acc[t][l] = _mm256_setzero_si256();
+                }
+            }
+            since = 0;
+        }
+    }
+    let mut out = [[0i64; L]; T];
+    for t in 0..T {
+        for l in 0..L {
+            let v = _mm256_add_epi64(wide[t][l], _mm256_cvtepi32_epi64(_mm256_castsi256_si128(acc[t][l])));
+            let v = _mm256_add_epi64(v, _mm256_cvtepi32_epi64(_mm256_extracti128_si256(acc[t][l], 1)));
+            out[t][l] = hsum_epi64(v);
+        }
+    }
+    out
+}
+
+/// [`limb_tile`] for 1 to 4 activations of 1 to 4 limbs; `limbs[t]` holds the
+/// activation's limb slices; `out[t][l]` receives the sums.
+///
+/// # Safety
+/// As [`limb_tile`]; `limbs.len()` in 1..=4, `l` in 1..=4.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn limb_tile_dyn(w: *const i16, limbs: &[[*const i16; 4]], l: usize, steps: usize, period: usize, out: &mut [[i64; 4]; 4]) {
+    macro_rules! go {
+        ($(($t:literal, $l:literal)),*) => {
+            match (limbs.len(), l) {
+                $( ($t, $l) => {
+                    let x: [[*const i16; $l]; $t] = std::array::from_fn(|i| std::array::from_fn(|j| limbs[i][j]));
+                    let s = limb_tile::<$t, $l>(w, x, steps, period);
+                    for i in 0..$t {
+                        out[i][..$l].copy_from_slice(&s[i]);
+                    }
+                } )*
+                _ => unreachable!(),
+            }
+        };
+    }
+    go!((1, 1), (1, 2), (1, 3), (1, 4), (2, 1), (2, 2), (2, 3), (2, 4), (3, 1), (3, 2), (3, 3), (3, 4), (4, 1), (4, 2), (4, 3), (4, 4))
+}
+
+// ============================================================================
 // Helper: horizontal sum of 4× i64 in __m256i
 // ============================================================================
 

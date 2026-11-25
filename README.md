@@ -82,6 +82,13 @@ assert_eq!(planar.matvec(&acts), dense);
   **`quantize_nvfp4` / `quantize_mxfp8`** with `matvec_quantized` evaluate
   the checkpoints' activation quantisation exactly: reference paths for
   measuring where precision matters.
+- **`Ptq1Matrix`** (0.1.6): ternary weights in the PTQ1_0 GGUF block
+  layout (1.75 bits per weight, a binary16 scale per 128 weights), with the
+  checkpoints' optional Walsh-Hadamard input rotation, exact; batches decode
+  each row panel once. **`I16Matrix`**: an exact i16 matvec. Batched
+  `RowScaledTQ19` forms on 16-bit multiply-adds, `matvec_rows` for a subset
+  of rows, batched `matvec_q2f` on the block-scaled forms, binary32
+  decoders in `bits`.
 - **`bits`** and **`quantize`** (0.6.5): binary16 / bfloat16 bit
   patterns (and E2M1, E4M3, UE8M0, binary32 as integer and exponent)
   decoded to fixed point by integer shifts, and the quantisers from

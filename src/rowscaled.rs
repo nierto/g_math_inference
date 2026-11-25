@@ -24,8 +24,8 @@
 
 use super::ops;
 use super::MAX_RAW;
-use g_math::fixed_point::{Compute, Fixed, FixedNum};
-use super::ops::WideOutput;
+use g_math::fixed_point::{Compute, Fixed, FixedNum, WideInt};
+use super::ops::{TqWord, WideOutput};
 use super::exact::Rounding;
 
 use rayon::prelude::*;
@@ -41,6 +41,8 @@ pub struct RowScaledTQ19 {
     scales_q32: Vec<u64>,
     /// Output rounding (see [`Rounding`]).
     rounding: Rounding,
+    /// The largest `|raw|` (bounds the batched kernel's 32-bit lanes).
+    max_abs: u32,
 }
 
 impl RowScaledTQ19 {
@@ -50,7 +52,8 @@ impl RowScaledTQ19 {
         assert_eq!(data.len(), rows * cols, "RowScaledTQ19: data length mismatch");
         assert_eq!(scales_q32.len(), rows, "RowScaledTQ19: scales length mismatch");
         debug_assert!(data.iter().all(|&w| (w as i32).abs() <= MAX_RAW as i32));
-        Self { rows, cols, data, scales_q32, rounding: Rounding::Default }
+        let max_abs = data.iter().map(|w| w.unsigned_abs() as u32).max().unwrap_or(0);
+        Self { rows, cols, data, scales_q32, rounding: Rounding::Default, max_abs }
     }
 
     /// The same matrix rounding its outputs by `rounding`. `Nearest` rounds
@@ -70,13 +73,7 @@ impl RowScaledTQ19 {
     where
         Fixed<S, F>: FixedNum<Storage = S>,
     {
-        match self.rounding {
-            Rounding::Default => Self::scale_row(ops::tq19_dot(row, x), s_q32),
-            Rounding::Nearest => {
-                let v = S::rowscaled_exact(ops::tq19_dot_exact_sum(row, x), s_q32, 0, Rounding::Nearest);
-                Fixed::from_raw(S::narrow(v).unwrap_or_else(|| panic!("RowScaledTQ19: scaled output exceeds storage range")))
-            }
-        }
+        self.out_from_acc::<S, F>(ops::tq19_dot_exact_sum(row, x), s_q32)
     }
 
     /// One output row at 2F fraction bits under the matrix's rounding.
@@ -85,10 +82,151 @@ impl RowScaledTQ19 {
     where
         Fixed<S, F>: FixedNum<Storage = S>,
     {
+        self.q2f_from_acc::<S, F>(ops::tq19_dot_exact_sum(row, x), s_q32)
+    }
+
+    /// An output at storage from the row's exact sum `sum raw * x`.
+    #[inline(always)]
+    fn out_from_acc<S: WideOutput, const F: u32>(&self, acc: Compute<Fixed<S, F>>, s_q32: u64) -> Fixed<S, F>
+    where
+        Fixed<S, F>: FixedNum<Storage = S>,
+    {
         match self.rounding {
-            Rounding::Default => Self::scale_row_q2f::<S, F>(ops::tq19_dot_q2f(row, x), s_q32),
-            Rounding::Nearest => S::rowscaled_exact(ops::tq19_dot_exact_sum(row, x), s_q32, F, Rounding::Nearest),
+            Rounding::Default => Self::scale_row(ops::tq19_from_acc::<S, F>(acc), s_q32),
+            Rounding::Nearest => {
+                let v = S::rowscaled_exact(acc, s_q32, 0, Rounding::Nearest);
+                Fixed::from_raw(S::narrow(v).unwrap_or_else(|| panic!("RowScaledTQ19: scaled output exceeds storage range")))
+            }
         }
+    }
+
+    /// An output at 2F fraction bits from the row's exact sum.
+    #[inline(always)]
+    fn q2f_from_acc<S: WideOutput, const F: u32>(&self, acc: Compute<Fixed<S, F>>, s_q32: u64) -> Compute<Fixed<S, F>>
+    where
+        Fixed<S, F>: FixedNum<Storage = S>,
+    {
+        match self.rounding {
+            Rounding::Default => Self::scale_row_q2f::<S, F>(ops::tq19_q2f_from_acc::<S, F>(acc), s_q32),
+            Rounding::Nearest => S::rowscaled_exact(acc, s_q32, F, Rounding::Nearest),
+        }
+    }
+
+    /// The exact row sums of a batch of 32-bit activations by the AVX2 kernel
+    /// that loads each 16-column weight chunk once for up to four activations
+    /// and multiplies 16-bit pairs (the activations as 11-bit limbs), handed
+    /// to `sink(b, r, sum)` (each pair once). `false` (nothing called) for
+    /// other words, without AVX2, or past 2^16 columns.
+    fn batch_sums_i32<S: TqWord, const F: u32>(&self, batch: &[&[Fixed<S, F>]], sink: &(dyn Fn(usize, usize, i64) + Sync)) -> bool
+    where
+        Fixed<S, F>: FixedNum<Storage = S>,
+    {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use super::simd::LIMB_BITS;
+            // past 2^16 columns an i64 row sum could overflow: the exact per-row path
+            if batch.is_empty() || self.rows == 0 || self.cols > 1 << 16 || !crate::tq5::avx2_available() {
+                return false;
+            }
+            let raws: Option<Vec<&[i32]>> = batch.iter().map(|x| S::as_i32_slice(Fixed::raw_slice(x))).collect();
+            let Some(raws) = raws else { return false };
+            let cols = self.cols;
+            let steps = cols / 16;
+            let head = 16 * steps;
+            // the fewest limbs (one count for the batch) that hold every activation:
+            // lower limbs in [0, 2^11), the top one in [-2^11, 2^11]
+            let lo = raws.iter().flat_map(|a| a.iter()).copied().min().unwrap_or(0) as i64;
+            let hi = raws.iter().flat_map(|a| a.iter()).copied().max().unwrap_or(0) as i64;
+            let l = (1..=3usize)
+                .find(|&l| {
+                    let k = LIMB_BITS * (l as u32 - 1);
+                    (lo >> k) >= -(1 << LIMB_BITS) && (hi >> k) <= 1 << LIMB_BITS
+                })
+                .expect("three 11-bit limbs hold every i32");
+            let limbs: Vec<Vec<i16>> = raws
+                .iter()
+                .map(|a| {
+                    let mut v = vec![0i16; l * head];
+                    for (c, &x) in a[..head].iter().enumerate() {
+                        let mut x = x as i64;
+                        for j in 0..l - 1 {
+                            v[j * head + c] = (x & ((1 << LIMB_BITS) - 1)) as i16;
+                            x >>= LIMB_BITS;
+                        }
+                        v[(l - 1) * head + c] = x as i16;
+                    }
+                    v
+                })
+                .collect();
+            // a lane gains at most 2 * max|w| * 2^11 per step: move it to 64 bits before 2^31
+            let pair = 2 * self.max_abs as u64 * (1u64 << LIMB_BITS);
+            let period = if pair == 0 { usize::MAX } else { (((1u64 << 31) - 1) / pair) as usize };
+            let min_rows = (crate::tq5::MIN_TASK_BYTES / (2 * cols).max(1)).max(1);
+            (0..self.rows).into_par_iter().with_min_len(min_rows).for_each(|r| {
+                let row = &self.data[r * cols..(r + 1) * cols];
+                let mut out = [[0i64; 4]; 4];
+                for (c, chunk) in limbs.chunks(4).enumerate() {
+                    let mut ptrs = [[std::ptr::null::<i16>(); 4]; 4];
+                    for (i, v) in chunk.iter().enumerate() {
+                        for j in 0..l {
+                            ptrs[i][j] = v[j * head..].as_ptr();
+                        }
+                    }
+                    // SAFETY: AVX2 checked; row and every limb slice hold `head` words;
+                    // `period` keeps every 32-bit lane in range
+                    unsafe { super::simd::limb_tile_dyn(row.as_ptr(), &ptrs[..chunk.len()], l, steps, period, &mut out) };
+                    for (i, sums) in out[..chunk.len()].iter().enumerate() {
+                        let b = 4 * c + i;
+                        // |sum| <= 2^16 columns * 2^15 * 2^31: an i64
+                        let v: i64 = (0..l).map(|j| sums[j] << (LIMB_BITS * j as u32)).sum();
+                        let tail: i64 = row[head..].iter().zip(&raws[b][head..]).map(|(&w, &x)| w as i64 * x as i64).sum();
+                        sink(b, r, v + tail);
+                    }
+                }
+            });
+            return true;
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = (batch, sink);
+            false
+        }
+    }
+
+    /// The outputs of a subset of rows: `out[i]` is row `rows[i]` of
+    /// [`Self::matvec`], the same value (exact logits for a few candidates).
+    ///
+    /// # Panics
+    /// Panics on an activation length mismatch or a row index out of range.
+    pub fn matvec_rows<S: WideOutput, const F: u32>(&self, rows: &[usize], activations: &[Fixed<S, F>]) -> Vec<Fixed<S, F>>
+    where
+        Fixed<S, F>: FixedNum<Storage = S>,
+    {
+        assert_eq!(activations.len(), self.cols, "RowScaledTQ19::matvec_rows: activation length mismatch");
+        rows.iter()
+            .map(|&r| {
+                assert!(r < self.rows, "RowScaledTQ19::matvec_rows: row {r} out of range");
+                self.row_out(&self.data[r * self.cols..(r + 1) * self.cols], activations, self.scales_q32[r])
+            })
+            .collect()
+    }
+
+    /// The wide outputs of a subset of rows: `out[i]` is row `rows[i]` of
+    /// [`Self::matvec_q2f`], the same value.
+    ///
+    /// # Panics
+    /// As [`Self::matvec_rows`].
+    pub fn matvec_rows_q2f<S: WideOutput, const F: u32>(&self, rows: &[usize], activations: &[Fixed<S, F>]) -> Vec<Compute<Fixed<S, F>>>
+    where
+        Fixed<S, F>: FixedNum<Storage = S>,
+    {
+        assert_eq!(activations.len(), self.cols, "RowScaledTQ19::matvec_rows_q2f: activation length mismatch");
+        rows.iter()
+            .map(|&r| {
+                assert!(r < self.rows, "RowScaledTQ19::matvec_rows_q2f: row {r} out of range");
+                self.row_out_q2f(&self.data[r * self.cols..(r + 1) * self.cols], activations, self.scales_q32[r])
+            })
+            .collect()
     }
 
     pub fn rows(&self) -> usize { self.rows }
@@ -194,6 +332,18 @@ impl RowScaledTQ19 {
         for (i, v) in batch.iter().enumerate() {
             assert_eq!(v.len(), self.cols, "RowScaledTQ19::matvec_q2f_batch_par: activation[{i}] length mismatch");
         }
+        let mut flat = vec![<Compute<Fixed<S, F>> as WideInt>::zero(); batch.len() * self.rows];
+        {
+            let sink = ops::BatchOut::new(&mut flat, self.rows, batch.len(), "RowScaledTQ19::matvec_q2f_batch_par");
+            let scales = &self.scales_q32;
+            // SAFETY: each (vector, row) pair is handed over once
+            let fast = self.batch_sums_i32(batch, &|b, r, acc| unsafe {
+                sink.write(b, r, self.q2f_from_acc::<S, F>(<Compute<Fixed<S, F>> as WideInt>::from_i64(acc), scales[r]))
+            });
+            if fast {
+                return if self.rows == 0 { vec![Vec::new(); batch.len()] } else { flat.chunks_exact(self.rows).map(<[_]>::to_vec).collect() };
+            }
+        }
         let per_row: Vec<Vec<Compute<Fixed<S, F>>>> = (0..self.rows)
             .into_par_iter()
             .map(|r| {
@@ -226,6 +376,13 @@ impl RowScaledTQ19 {
             assert_eq!(v.len(), self.cols, "RowScaledTQ19::matvec_batch_par_into: activation[{i}] length mismatch");
         }
         let sink = ops::BatchOut::new(out, self.rows, batch.len(), "RowScaledTQ19::matvec_batch_par_into");
+        let scales = &self.scales_q32;
+        // SAFETY: each (vector, row) pair is handed over once
+        if self.batch_sums_i32(batch, &|b, r, acc| unsafe {
+            sink.write(b, r, self.out_from_acc::<S, F>(<Compute<Fixed<S, F>> as WideInt>::from_i64(acc), scales[r]))
+        }) {
+            return;
+        }
         (0..self.rows).into_par_iter().for_each(|r| {
             let row = &self.data[r * self.cols..(r + 1) * self.cols];
             let s = self.scales_q32[r];
@@ -243,6 +400,11 @@ impl RowScaledTQ19 {
         {
         for (i, v) in batch.iter().enumerate() {
             assert_eq!(v.len(), self.cols, "RowScaledTQ19::matvec_batch_par: activation[{i}] length mismatch");
+        }
+        if self.rows > 0 && !batch.is_empty() && batch.iter().all(|x| S::as_i32_slice(Fixed::raw_slice(x)).is_some()) {
+            let mut flat = vec![Fixed::from_raw(<S as WideInt>::zero()); batch.len() * self.rows];
+            self.matvec_batch_par_into(batch, &mut flat);
+            return flat.chunks_exact(self.rows).map(<[_]>::to_vec).collect();
         }
         let per_row: Vec<Vec<Fixed<S, F>>> = (0..self.rows)
             .into_par_iter()

@@ -7,11 +7,21 @@ independently of the crate's integer decoders: no float type anywhere.
 Outputs are floor(sum_c value(r, c) * x[c]) at the activations' raw scale
 (the F fractional bits cancel) and floor(... * 2^F) for the wide form.
 
+Every output is computed a second time by mpmath at 120 digits, from
+independent mpmath decoders (ldexp of the integer fields); the generator
+asserts the decoders agree on every pattern and the outputs agree (the floor
+of a value can differ only where the exact value is an integer, which the
+Fraction value then shows).
+
 Writes tests/data/blockscaled_refs.rs.
 """
 from fractions import Fraction as Fr
 import math
 import os
+from mpmath import mp, mpf, ldexp, floor as mfloor, fsum
+
+mp.dps = 120
+MP_AGREED = [0]
 
 TWO = Fr(2)
 
@@ -42,6 +52,61 @@ def f32(bits):
         return None
     v = Fr(m, 1 << 23) * TWO ** -126 if e == 0 else (1 + Fr(m, 1 << 23)) * TWO ** (e - 127)
     return -v if s else v
+
+
+def e2m1_m(code):
+    s, e, m = code >> 3, (code >> 1) & 3, code & 1
+    v = ldexp(mpf(m), -1) if e == 0 else ldexp(mpf(2 + m), e - 2)
+    return -v if s else v
+
+
+def e4m3_m(b):
+    s, e, m = b >> 7, (b >> 3) & 15, b & 7
+    if e == 15 and m == 7:
+        return None
+    v = ldexp(mpf(m), -9) if e == 0 else ldexp(mpf(8 + m), e - 10)
+    return -v if s else v
+
+
+def ue8m0_m(b):
+    return None if b == 255 else ldexp(mpf(1), b - 127)
+
+
+def f32_m(bits):
+    s, e, m = bits >> 31, (bits >> 23) & 255, bits & ((1 << 23) - 1)
+    if e == 255:
+        return None
+    v = ldexp(mpf(m), -149) if e == 0 else ldexp(mpf((1 << 23) + m), e - 150)
+    return -v if s else v
+
+
+def mpq(fr):
+    return mpf(fr.numerator) / fr.denominator
+
+
+# the mpmath decoders equal the Fraction decoders on every pattern
+for c in range(16):
+    assert e2m1_m(c) == mpq(e2m1(c))
+for b in range(256):
+    assert (e4m3_m(b) is None) == (e4m3(b) is None) and (e4m3(b) is None or e4m3_m(b) == mpq(e4m3(b)))
+    assert (ue8m0_m(b) is None) == (ue8m0(b) is None) and (ue8m0(b) is None or ue8m0_m(b) == mpq(ue8m0(b)))
+
+
+def mp_check(vals_m, x, frac, outs):
+    """The four outputs again by mpmath from the mpmath values; a floor may differ
+    only where the exact value is an integer."""
+    n, w, nn, wn = outs
+    half = mpf(1) / 2
+    for r, row in enumerate(vals_m):
+        sm = fsum(wv * xi for wv, xi in zip(row, x))
+        for got, v in ((n[r], sm), (w[r], ldexp(sm, frac)), (nn[r], sm + half), (wn[r], ldexp(sm, frac) + half)):
+            if got is None:
+                continue
+            f = int(mfloor(v))
+            if f != got:
+                # the value is (within 10^-100) the integer got + 1 or got: an exact boundary
+                assert abs(v - mpf(got)) < mpf(10) ** -100 or abs(v - mpf(got + 1)) < mpf(10) ** -100, (got, v)
+            MP_AGREED[0] += 1
 
 
 # anchors from the spec text
@@ -161,6 +226,16 @@ def nv_cases(rng):
                     row.append(e2m1(code) * e4m3(scales[(r * cols + c) // 16]) * fac)
                 vals.append(row)
             n, w, nn, wn = outputs(vals, x, frac)
+            fac_m = f32_m(amax) / f32_m(den)
+            vals_m = []
+            for r in range(rows):
+                rm = []
+                for c in range(cols):
+                    byte = codes[(r * cols + c) // 2]
+                    code = byte & 15 if c % 2 == 0 else byte >> 4
+                    rm.append(e2m1_m(code) * e4m3_m(scales[(r * cols + c) // 16]) * fac_m)
+                vals_m.append(rm)
+            mp_check(vals_m, x, frac, (n, w, nn, wn))
             cases.append(dict(rows=rows, cols=cols, a=codes, s=scales, amax=amax, den=den, frac=frac, x=x, out=n, q2f=w, near=nn, q2f_near=wn, mode=mode))
     return cases
 
@@ -215,6 +290,8 @@ def mx_cases(rng):
                 x = activation(rng, cols, kind)
                 vals = [[e4m3(elems[r * cols + c]) * ue8m0(scales[(r * cols + c) // 32]) for c in range(cols)] for r in range(rows)]
                 n, w, nn, wn = outputs(vals, x, frac)
+                vals_m = [[e4m3_m(elems[r * cols + c]) * ue8m0_m(scales[(r * cols + c) // 32]) for c in range(cols)] for r in range(rows)]
+                mp_check(vals_m, x, frac, (n, w, nn, wn))
                 cases.append(dict(rows=rows, cols=cols, a=elems, s=scales, frac=frac, x=x, out=n, q2f=w, near=nn, q2f_near=wn, mode=smode + "/" + emode))
     return cases
 
@@ -265,7 +342,7 @@ def main():
         f.write("];\n")
     rows = [v for c in nv + mx for v in c["out"]]
     over = sum(v is None or not (I32_MIN <= v <= I32_MAX) for v in rows)
-    print(f"{len(nv)} NVFP4 cases, {len(mx)} MXFP8 cases, {len(rows)} rows, {over} rows leave i32 (expect a panic); wrote {os.path.normpath(out)}")
+    print(f"mpmath agreed on {MP_AGREED[0]} outputs; {len(nv)} NVFP4 cases, {len(mx)} MXFP8 cases, {len(rows)} rows, {over} rows leave i32 (expect a panic); wrote {os.path.normpath(out)}")
 
 
 if __name__ == "__main__":

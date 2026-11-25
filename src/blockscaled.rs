@@ -1271,7 +1271,7 @@ thread_local! {
 /// sum is then combined exactly and finished once. Every other (activation,
 /// row) takes the per-row path, a row read once per eight activations. Every
 /// path forms the same exact row sum.
-fn matvec_batch_par_into_raw<M: BlockRows>(m: &M, batch: &[&[i32]], out: &mut [i32]) {
+fn matvec_batch_par_into_raw<M: BlockRows, T: Copy + Send>(m: &M, batch: &[&[i32]], out: &mut [T], extra: i32, narrow: fn(Option<i128>, &str) -> T) {
     for x in batch {
         check_len(m, x, "matvec_batch_par");
     }
@@ -1302,13 +1302,13 @@ fn matvec_batch_par_into_raw<M: BlockRows>(m: &M, batch: &[&[i32]], out: &mut [i
             for &(k, lo, hi) in &slot {
                 let s = sums[lo] + hi.map_or_else(|| m.hi_corr(r, splits[k].as_ref().unwrap()), |h| sums[h] << 16);
                 // SAFETY: each row belongs to one task
-                unsafe { sink.write(k, r, narrow_i32(m.finish_sum(s, 0), what)) };
+                unsafe { sink.write(k, r, narrow(m.finish_sum(s, extra), what)) };
             }
         });
         for &k in (0..batch.len()).filter(|&k| splits[k].is_none()).collect::<Vec<_>>().iter() {
             (0..rows).into_par_iter().with_min_len(min_rows_per_task(m)).for_each(|r| {
                 // SAFETY: each row belongs to one task
-                unsafe { sink.write(k, r, narrow_i32(m.row_out(r, batch[k], None, 0), what)) };
+                unsafe { sink.write(k, r, narrow(m.row_out(r, batch[k], None, extra), what)) };
             });
         }
         return;
@@ -1408,7 +1408,7 @@ fn matvec_batch_par_into_raw<M: BlockRows>(m: &M, batch: &[&[i32]], out: &mut [i
                     if let Some((lo, hi)) = *slot {
                         let s = sums[lo * rows + r] + hi.map_or(0, |h| sums[h * rows + r] << 16);
                         // SAFETY: each row belongs to one task
-                        unsafe { sink.write(k, r, narrow_i32(m.finish_sum(s, 0), what)) };
+                        unsafe { sink.write(k, r, narrow(m.finish_sum(s, extra), what)) };
                     }
                 }
             });
@@ -1419,7 +1419,7 @@ fn matvec_batch_par_into_raw<M: BlockRows>(m: &M, batch: &[&[i32]], out: &mut [i
         (0..rows).into_par_iter().with_min_len(min_rows_per_task(m)).for_each(|r| {
             for &k in tile {
                 // SAFETY: each row belongs to one task, each token to one tile
-                unsafe { sink.write(k, r, narrow_i32(m.row_out(r, batch[k], splits[k].as_ref(), 0), what)) };
+                unsafe { sink.write(k, r, narrow(m.row_out(r, batch[k], splits[k].as_ref(), extra), what)) };
             }
         });
     }
@@ -1486,7 +1486,31 @@ macro_rules! public_forms {
                 Fixed<i32, F>: FixedNum<Storage = i32>,
             {
                 let raw: Vec<&[i32]> = batch.iter().map(|x| Fixed::raw_slice(x)).collect();
-                matvec_batch_par_into_raw(self, &raw, Fixed::raw_slice_mut(out))
+                matvec_batch_par_into_raw(self, &raw, Fixed::raw_slice_mut(out), 0, narrow_i32)
+            }
+            /// The batched form of [`Self::matvec_q2f`] (wide outputs at `2F`
+            /// fractional bits, one rounding): the same results, by the same
+            /// decode-once kernels as [`Self::matvec_batch_par`].
+            pub fn matvec_q2f_batch_par<const F: u32>(&self, batch: &[&[Fixed<i32, F>]]) -> Vec<Vec<i64>>
+            where
+                Fixed<i32, F>: FixedNum<Storage = i32>,
+            {
+                let rows = self.rows;
+                let mut flat = vec![0i64; batch.len() * rows];
+                self.matvec_q2f_batch_par_into(batch, &mut flat);
+                if rows == 0 {
+                    return vec![Vec::new(); batch.len()];
+                }
+                flat.chunks_exact(rows).map(<[i64]>::to_vec).collect()
+            }
+            /// [`Self::matvec_q2f_batch_par`] into a caller buffer of
+            /// `batch.len() * rows` values, activation-major (`out[b * rows + r]`).
+            pub fn matvec_q2f_batch_par_into<const F: u32>(&self, batch: &[&[Fixed<i32, F>]], out: &mut [i64])
+            where
+                Fixed<i32, F>: FixedNum<Storage = i32>,
+            {
+                let raw: Vec<&[i32]> = batch.iter().map(|x| Fixed::raw_slice(x)).collect();
+                matvec_batch_par_into_raw(self, &raw, out, F as i32, narrow_i64)
             }
             /// Wide output at `2F` fractional bits: `floor(sum_c value(r, c) * x[c] * 2^F)`.
             pub fn matvec_q2f<const F: u32>(&self, x: &[Fixed<i32, F>]) -> Vec<i64>

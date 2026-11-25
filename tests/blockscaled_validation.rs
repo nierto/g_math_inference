@@ -7,7 +7,8 @@
 //!    leaves the word).
 //! 3. A random differential at checkpoint shapes against an in-test exact
 //!    reference built only on the generated tables and hardware division:
-//!    every form, batches 1..9 and 64, 1 to 8 threads.
+//!    every form (the batched wide form `matvec_q2f_batch_par` too), batches
+//!    1..9 and 64, 1 to 8 threads.
 //!
 //! No float anywhere.
 
@@ -112,6 +113,14 @@ macro_rules! check_forms {
                 raw(o)
             });
             assert_eq!(flat, want.map(|v| v.concat()), "{} batch_into {b}", $what);
+            let want_q = wide.clone().map(|v| vec![v; b]);
+            assert_eq!(run(|| m.matvec_q2f_batch_par(&batch)), want_q, "{} q2f batch {b}", $what);
+            let flat_q = run(|| {
+                let mut o = vec![0i64; b * m.rows()];
+                m.matvec_q2f_batch_par_into(&batch, &mut o);
+                o
+            });
+            assert_eq!(flat_q, want_q.map(|v| v.concat()), "{} q2f batch_into {b}", $what);
         }
     }};
 }
@@ -341,6 +350,9 @@ macro_rules! forms_q22_10 {
                     a
                 })
                 .collect();
+            // the batched wide form: every vector at once, == the single wide form
+            let qb = run(|| m.matvec_q2f_batch_par(&refs));
+            assert_eq!(qb, q2f.iter().cloned().collect::<Option<Vec<_>>>(), "matvec_q2f_batch_par vs matvec_q2f");
             (single, batch, flat, q2f)
         }
     };

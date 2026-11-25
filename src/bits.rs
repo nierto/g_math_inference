@@ -17,6 +17,8 @@
 //!   [`decompose_f32`]: the element and scale formats of block-scaled
 //!   checkpoints (NVFP4, MXFP8) and their 32-bit factors, as integers; the
 //!   kernels over them are in [`super::blockscaled`].
+//! - [`f32_to_raw`], [`f32_to_storage_raw`], [`f32_to_fixed`]: binary32
+//!   patterns at a fixed-point format by the same truncation as the 16-bit forms.
 //!
 //! Infinities and NaNs are refused with `InvalidInput`; a value outside the
 //! target range is `TierOverflow`.
@@ -67,13 +69,17 @@ pub fn decompose(bits: u16, kind: HalfKind) -> Result<(bool, u64, i32), Overflow
 /// for a non-finite pattern.
 pub fn to_raw(bits: u16, kind: HalfKind, frac_bits: u32) -> Result<i128, OverflowDetected> {
     let (sign, m, e) = decompose(bits, kind)?;
+    trunc_raw(sign, m, e, frac_bits)
+}
+
+/// `trunc(+-m * 2^(e + frac_bits))` toward zero as an i128, `TierOverflow` past it.
+fn trunc_raw(sign: bool, m: u64, e: i32, frac_bits: u32) -> Result<i128, OverflowDetected> {
     if m == 0 {
         return Ok(0);
     }
     let shift = e as i64 + frac_bits as i64;
     let mag: i128 = if shift >= 0 {
-        // m has at most 11 significant bits
-        let top = 64 - m.leading_zeros() as i64;
+        let top = 64 - m.leading_zeros() as i64; // at most 24 bits (binary32)
         if top + shift > 127 {
             return Err(OverflowDetected::TierOverflow);
         }
@@ -233,4 +239,37 @@ pub fn decompose_f32(bits: u32) -> Result<(bool, u64, i32), OverflowDetected> {
         return Err(OverflowDetected::InvalidInput);
     }
     Ok(if exp == 0 { (sign, mant, -149) } else { (sign, mant | 0x0080_0000, exp - 150) })
+}
+
+/// A binary32 pattern at `frac_bits` fractional bits: `trunc(v * 2^frac_bits)`
+/// toward zero as an i128, the rule of [`to_raw`]. Exact whenever the value
+/// has no bits below `2^-frac_bits`; the exact value itself is
+/// [`decompose_f32`]. `Err(TierOverflow)` when the result does not fit i128,
+/// `Err(InvalidInput)` for an infinity or a NaN.
+pub fn f32_to_raw(bits: u32, frac_bits: u32) -> Result<i128, OverflowDetected> {
+    let (sign, m, e) = decompose_f32(bits)?;
+    trunc_raw(sign, m, e, frac_bits)
+}
+
+/// A binary32 pattern as a raw storage word of `F` fraction bits (truncated
+/// toward zero), `TierOverflow` when its magnitude does not fit the word, the
+/// rule of [`to_storage_raw`].
+pub fn f32_to_storage_raw<S: Storage, const F: u32>(bits: u32) -> Result<S, OverflowDetected>
+where
+    Fixed<S, F>: FixedNum<Storage = S>,
+{
+    let raw = f32_to_raw(bits, F)?;
+    match (S::from_i128_checked(raw), raw.checked_neg().and_then(S::from_i128_checked)) {
+        (Some(v), Some(_)) => Ok(v),
+        _ => Err(OverflowDetected::TierOverflow),
+    }
+}
+
+/// A binary32 pattern as a `Fixed<S, F>` (truncated toward zero), `TierOverflow` past the word.
+#[inline]
+pub fn f32_to_fixed<S: Storage, const F: u32>(bits: u32) -> Result<Fixed<S, F>, OverflowDetected>
+where
+    Fixed<S, F>: FixedNum<Storage = S>,
+{
+    Ok(Fixed::from_raw(f32_to_storage_raw::<S, F>(bits)?))
 }

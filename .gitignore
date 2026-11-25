@@ -1,3 +1,5 @@
 /target
 /differential/target*
 /perf_gate/target
+__pycache__/
+/.cargo

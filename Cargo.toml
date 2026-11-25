@@ -1,6 +1,6 @@
 [package]
 name = "g_math_inference"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "TQ1.9 and five-trit ternary inference kernels over g_math fixed-point formats"
 authors = ["Niels Erik Toren"]
@@ -12,7 +12,7 @@ categories = ["mathematics", "science"]
 exclude = ["differential/", "scripts/", "perf_gate/"]
 
 [dependencies]
-g_math = "0.7"
+g_math = "0.7.6"
 rayon = "1.10"
 
 [profile.release]

@@ -58,6 +58,9 @@ fn time2(reps: usize, mut f: impl FnMut(), mut g: impl FnMut()) -> (f64, f64) {
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("crossover") { crossover(); return; }
     if std::env::args().nth(1).as_deref() == Some("blockscaled") { blockscaled(); return; }
+    if std::env::args().nth(1).as_deref() == Some("rowscaled19") { rowscaled19(); return; }
+    if std::env::args().nth(1).as_deref() == Some("ptq1") { ptq1(); return; }
+    if std::env::args().nth(1).as_deref() == Some("i16") { i16_gemv(); return; }
     let mut rng = Rng(0x5EED_0001);
     println!("threads: {}", rayon::current_num_threads());
     println!("{:<34} {:>14} {:>14} {:>8}", "RowScaledTQ5", "0.1.2 ns", "now ns", "ratio");
@@ -147,4 +150,119 @@ fn blockscaled() {
             println!("  {:<38} {:>12.1} {:>12.1} {:>12.1} {:>7.2} {:>7.2}", mode, a, b, c, b / a, c / a);
         }
     }
+}
+
+fn tq19_parts(rng: &mut Rng, rows: usize, cols: usize) -> (Vec<i16>, Vec<u64>) {
+    let data = (0..rows * cols).map(|_| ((rng.next() % 59049) as i64 - 29524) as i16).collect();
+    let scales = (0..rows).map(|_| (1u64 << 28) + rng.next() % (1u64 << 33)).collect();
+    (data, scales)
+}
+
+/// RowScaledTQ19 matvec_batch_par, the published 0.1.2 against this tree, B = 1..8,
+/// at the attention and LM-head shapes; K distinct matrices cycled (DRAM).
+fn rowscaled19() {
+    let mut rng = Rng(0x0019_B47C);
+    println!("threads: {}", rayon::current_num_threads());
+    println!("{:<34} {:>12} {:>12} {:>7}", "us per call (median)", "0.1.2", "new", "new/old");
+    for &(name, rows, cols, k) in &[("q/gate 3072x2304", 3072usize, 2304usize, 8usize), ("k/v 1024x2304", 1024, 2304, 16), ("o 2304x3072", 2304, 3072, 8), ("wr 384x2304", 384, 2304, 32), ("LM head 200058x2304", 200058, 2304, 1)] {
+        let mats: Vec<(old::RowScaledTQ19, new::RowScaledTQ19)> = (0..k)
+            .map(|_| {
+                let (d, s) = tq19_parts(&mut rng, rows, cols);
+                (old::RowScaledTQ19::from_parts(rows, cols, d.clone(), s.clone()), new::RowScaledTQ19::from_parts(rows, cols, d, s))
+            })
+            .collect();
+        let xs: Vec<Vec<Fx>> = (0..8).map(|_| activation(&mut rng, cols)).collect();
+        let refs: Vec<&[Fx]> = xs.iter().map(|v| &v[..]).collect();
+        println!("{name}:");
+        let reps = if rows > 100_000 { 9 } else { 60 };
+        {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for i in 0..reps + 3 {
+                let (o, n) = &mats[i % k];
+                let t = Instant::now();
+                black_box(o.matvec_par(black_box(&xs[0])));
+                let ta = t.elapsed().as_nanos() as f64;
+                let t = Instant::now();
+                black_box(n.matvec_par(black_box(&xs[0])));
+                let tb = t.elapsed().as_nanos() as f64;
+                if i >= 3 { a.push(ta); b.push(tb); }
+            }
+            let (a, b) = (median(a) / 1e3, median(b) / 1e3);
+            println!("  {:<32} {:>12.1} {:>12.1} {:>7.2}", "matvec_par (B = 1)", a, b, b / a);
+        }
+        for bs in 1..=8 {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let sub = &refs[..bs];
+            for i in 0..reps + 3 {
+                let (o, n) = &mats[i % k];
+                let t = Instant::now();
+                black_box(o.matvec_batch_par(black_box(sub)));
+                let ta = t.elapsed().as_nanos() as f64;
+                let t = Instant::now();
+                black_box(n.matvec_batch_par(black_box(sub)));
+                let tb = t.elapsed().as_nanos() as f64;
+                if i >= 3 { a.push(ta); b.push(tb); }
+            }
+            let (a, b) = (median(a) / 1e3, median(b) / 1e3);
+            println!("  {:<32} {:>12.1} {:>12.1} {:>7.2}", format!("matvec_batch_par B = {bs}"), a, b, b / a);
+        }
+    }
+}
+
+/// Ptq1Matrix (with the 1024 Walsh-Hadamard transform and signs) beside
+/// RowScaledTQ5 at a 27B model's shapes, B = 1, 8, 64, 512.
+fn ptq1() {
+    let mut rng = Rng(0x0F71_0001);
+    println!("threads: {}", rayon::current_num_threads());
+    println!("{:<34} {:>12} {:>12} {:>9}", "us per call (median)", "TQ5", "PTQ1", "PTQ1/TQ5");
+    for &(rows, cols) in &[(5120usize, 5120usize), (17408, 5120), (5120, 17408)] {
+        let k = if rows * cols > 50_000_000 { 2 } else { 6 };
+        let tq: Vec<new::RowScaledTQ5> = (0..k).map(|_| { let (d, s) = parts(&mut rng, rows, cols); new::RowScaledTQ5::from_parts(rows, cols, d, s) }).collect();
+        let pt: Vec<new::Ptq1Matrix> = (0..k)
+            .map(|_| {
+                let mut blocks = vec![0u8; rows * cols / 128 * 28];
+                for b in blocks.chunks_exact_mut(28) {
+                    for v in b.iter_mut().take(26) { *v = ((rng.next() % 243) * 256).div_ceil(243) as u8; }
+                    let h: u16 = (((rng.next() % 4) + 6) << 10) as u16 | (rng.next() & 1023) as u16; // 2^-9 .. 2^-6
+                    b[26..28].copy_from_slice(&h.to_le_bytes());
+                }
+                let signs: Vec<i8> = (0..cols).map(|_| if rng.next() & 1 == 0 { 1 } else { -1 }).collect();
+                new::Ptq1Matrix::from_parts(rows, cols, blocks).unwrap().with_hadamard(1024, Some(signs)).unwrap()
+            })
+            .collect();
+        println!("{rows}x{cols}: bytes TQ5 {:.1} MB, PTQ1 {:.1} MB", tq[0].size_bytes() as f64 / 1e6, pt[0].size_bytes() as f64 / 1e6);
+        let xs: Vec<Vec<Fx>> = (0..512).map(|_| activation(&mut rng, cols)).collect();
+        let refs: Vec<&[Fx]> = xs.iter().map(|v| &v[..]).collect();
+        for &(bs, reps) in &[(1usize, 40usize), (8, 20), (64, 6), (512, 3)] {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let sub = &refs[..bs];
+            for i in 0..reps + 1 {
+                let j = i % k;
+                let t = Instant::now();
+                if bs == 1 { black_box(tq[j].matvec_par(black_box(&xs[0]))); } else { black_box(tq[j].matvec_batch_par(black_box(sub))); }
+                let ta = t.elapsed().as_nanos() as f64;
+                let t = Instant::now();
+                if bs == 1 { black_box(pt[j].matvec_par(black_box(&xs[0]))); } else { black_box(pt[j].matvec_batch_par(black_box(sub))); }
+                let tb = t.elapsed().as_nanos() as f64;
+                if i >= 1 { a.push(ta); b.push(tb); }
+            }
+            let (a, b) = (median(a) / 1e3, median(b) / 1e3);
+            println!("  {:<32} {:>12.1} {:>12.1} {:>9.2}", if bs == 1 { "matvec_par (B = 1)".to_string() } else { format!("matvec_batch_par B = {bs}") }, a, b, b / a);
+        }
+    }
+}
+
+/// I16Matrix::matvec_i64_par at the folded draft head's shape, 200058 x 256.
+fn i16_gemv() {
+    let mut rng = Rng(0x0016_0256);
+    let (rows, cols) = (200058usize, 256usize);
+    let m = new::I16Matrix::from_parts(rows, cols, (0..rows * cols).map(|_| ((rng.next() % 16385) as i32 - 8192) as i16).collect());
+    let t: Vec<i16> = (0..cols).map(|_| ((rng.next() % 65535) as i32 - 32767) as i16).collect();
+    let mut v = Vec::new();
+    for i in 0..23 {
+        let s = Instant::now();
+        black_box(m.matvec_i64_par(black_box(&t)));
+        if i >= 3 { v.push(s.elapsed().as_nanos() as f64); }
+    }
+    println!("threads: {}  I16Matrix {rows}x{cols} ({:.1} MB) matvec_i64_par: {:.0} us median", rayon::current_num_threads(), m.size_bytes() as f64 / 1e6, median(v) / 1e3);
 }

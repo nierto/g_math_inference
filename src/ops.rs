@@ -31,6 +31,13 @@ pub trait TqWord: Storage {
     fn trit_dot_fast(_trits: &[i8], _activations: &[Self]) -> Option<Self::Compute> {
         None
     }
+    /// The activations as 32-bit words when this is the 32-bit word (the
+    /// batched AVX2 kernels), `None` otherwise.
+    #[doc(hidden)]
+    #[inline]
+    fn as_i32_slice(_activations: &[Self]) -> Option<&[i32]> {
+        None
+    }
     /// Whether `len` worst-case terms sum at the compute tier without a
     /// per-term check (the 32-bit word's i64 accumulator holds 2^16 of them).
     #[doc(hidden)]
@@ -70,6 +77,10 @@ impl TqWord for i64 {
 }
 
 impl TqWord for i32 {
+    #[inline]
+    fn as_i32_slice(activations: &[i32]) -> Option<&[i32]> {
+        Some(activations)
+    }
     #[inline]
     fn tq19_dot_fast(weights: &[i16], activations: &[i32]) -> Option<i64> {
         if !Self::unchecked_sum_fits(weights.len()) {
@@ -382,6 +393,24 @@ where
 {
     debug_assert_eq!(weights.len(), activations.len());
     wide_output_r::<S, F>(r, tq19_dot_compute::<S, F>(weights, activations))
+}
+
+/// [`tq19_dot`] from its exact row sum: the same value.
+#[inline]
+pub(crate) fn tq19_from_acc<S: TqWord, const F: u32>(acc: Compute<Fixed<S, F>>) -> Fixed<S, F>
+where
+    Fixed<S, F>: FixedNum<Storage = S>,
+{
+    narrow_to_storage::<S, F>(acc.divmod(compute_scale::<S>()).0)
+}
+
+/// [`tq19_dot_q2f`] from its exact row sum: the same value.
+#[inline]
+pub(crate) fn tq19_q2f_from_acc<S: WideOutput, const F: u32>(acc: Compute<Fixed<S, F>>) -> Compute<Fixed<S, F>>
+where
+    Fixed<S, F>: FixedNum<Storage = S>,
+{
+    wide_output::<S, F>(acc)
 }
 
 /// The exact row sum `sum w_i * a_i` on the compute word (for epilogues that

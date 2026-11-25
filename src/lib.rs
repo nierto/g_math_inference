@@ -74,6 +74,8 @@ macro_rules! on_words {
 pub mod bits;
 pub mod actquant;
 pub mod blockscaled;
+pub mod ptq1;
+mod lowrank;
 mod exact;
 mod hybrid;
 mod ops;
@@ -91,6 +93,8 @@ pub use ops::{TqWord, WideOutput};
 pub use rowscaled::RowScaledTQ19;
 pub use tq5::{RowScaledTQ5, TQ5_MAX};
 pub use blockscaled::{MxFp8Matrix, NvFp4Matrix};
+pub use ptq1::{Ptq1Matrix, PTQ1_BLOCK, PTQ1_BLOCK_BYTES};
+pub use lowrank::I16Matrix;
 pub use exact::Rounding;
 pub use actquant::{quantize_mxfp8, quantize_nvfp4, Mxfp8Activation, Nvfp4Activation};
 
